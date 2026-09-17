@@ -1,0 +1,22 @@
+# Python caches and compiled modules
+__pycache__/
+*.py[cod]
+
+# macOS folder metadata
+.DS_Store
+
+# Keep the separate Python worktree out of the Bash branch
+/hermes-podman-launcher-python/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+.venv/
+
+# Vim/Neovim temporary files
+*.swp
+*.swo
+# Unix swap files start with a dot; keep ordinary files such as .swf assets.
+.*.sw[a-n]
+*~
