@@ -19,6 +19,13 @@ must match your login, with the first letter capitalized: account `ezirius` uses
 `Ezirius`. Command arguments accept any case. Hermes Container does not create
 accounts, rename workspaces or select another account's workspace.
 
+A root-owned workspace base such as `/Volumes/Data` may be group writable when
+`WORKSPACE_BASE_ALLOW_GROUP_WRITE=true` (the shipped setting). Set it to `false`
+to refuse group write on the base too. The current user needs list and search
+access, which can be granted through a named ACL. World-writable bases are refused. User-owned
+bases and individual workspaces must belong to the current user and must not
+be group/world writable. The launcher does not modify permissions or ACLs.
+
 First setup offers a new setup or a restore. Hermes Home must be empty, apart
 from Finder's `.DS_Store`. Existing documents and separate backups may remain.
 An existing `Home/backups` directory needs manual inspection or migration first.
@@ -71,7 +78,8 @@ Environment variables do not replace these settings.
 `TRUSTED_TOOL_USERS=ezirius` allows tools from the shared Homebrew installation
 owned by `ezirius`. Root and the current user are also trusted. Additional account
 names can be separated by spaces. Tools must be executable and must not be
-group/world writable; this setting does not change workspace or data ownership checks.
+group/world writable; leave the list empty to trust only root and the current
+user. This setting does not change workspace or data ownership checks.
 
 **Stop Hermes before changing paths, image sources, ports, resources or restart
 policy.** These changes do not move data or modify an existing container. Reuse
@@ -153,7 +161,8 @@ Default minimums in the configuration file:
 These are project compatibility minimums, not claims of security or full platform
 validation.
 Bash 3.2+, jq 1.7+, curl and unzip are required; production does not use host Python.
-Tools must be root-owned or owned by your account and not group/world writable.
+Tools must belong to root, your account or a configured `TRUSTED_TOOL_USERS`
+account, and must not be group/world writable.
 The default engine requirement is native, rootless Linux with cgroups v2,
 2 CPUs and 6 GiB RAM. macOS needs an already running Podman VM sharing the data
 paths. Hermes Container does not install tools or configure or start that VM.

@@ -1,21 +1,27 @@
+podman_machine_name() {
+    # Podman 5.8.3 can report an empty DefaultMachine with a valid CurrentMachine.
+    json -er '
+        .Host | if .DefaultMachine == null or .DefaultMachine == ""
+        then .CurrentMachine else .DefaultMachine end
+        | select(type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))' || {
+        fail 3 'Podman machine info must identify a valid default or current machine'; return
+    }
+}
 # Freeze the macOS endpoint so later changes to Podman's default cannot redirect
 # a run. Verify its SSH endpoint against the machine used for storage checks.
 bind_machine_connection() {
     local machines detail connections endpoint key
     machines=$(podman_json machine info --format json) || return
-    # Podman 5.8.3 can report an empty DefaultMachine with a valid CurrentMachine.
-    BOUND_MACHINE=$(printf '%s' "$machines" | json -er '
-        .Host | if .DefaultMachine == null or .DefaultMachine == ""
-        then .CurrentMachine else .DefaultMachine end
-        | select(type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))') || {
-        fail 3 'Podman machine info must identify a valid default or current machine'; return
-    }
+    BOUND_MACHINE=$(printf '%s' "$machines" | podman_machine_name) || return
     detail=$(podman_json machine inspect "$BOUND_MACHINE") || return
     connections=$(podman_json system connection list --format json) || return
     endpoint=$(printf '%s' "$connections" | json -er --arg name "$BOUND_MACHINE" --argjson machine "$detail" '
-        if ($machine|type)!="array" or ($machine|length)!=1 then error("machine shape") else . end
-        | if $machine[0].Name!=$name or $machine[0].Rootful!=false or $machine[0].State!="running"
-          then error("expected running rootless machine") else . end
+        if ($machine|type)!="array" or ($machine|length)!=1
+          then error("machine inspection must describe exactly one machine") else . end
+        | if $machine[0].Name!=$name then error("inspected machine name differs from the selected machine")
+          elif $machine[0].State!="running" then error("selected Podman machine is not running")
+          elif $machine[0].Rootful!=false then error("selected Podman machine must use rootless mode (Rootful=false)")
+          else . end
         | map(select(.Default==true))
         | if length!=1 then error("default connection") else .[0] end
         | . as $connection
@@ -26,7 +32,9 @@ bind_machine_connection() {
           then $connection.URI else error("connection differs from machine") end') || {
         fail 3 'default Podman connection must use the selected running rootless machine'; return
     }
-    key=$(printf '%s' "$detail" | json -er '.[0].SSHConfig.IdentityPath | select(type=="string" and startswith("/"))') || return 3
+    key=$(printf '%s' "$detail" | json -er '.[0].SSHConfig.IdentityPath | select(type=="string" and startswith("/"))') || {
+        fail 3 'Podman machine must provide an absolute SSH identity path'; return
+    }
     PODMAN_OPTIONS=(--url "$endpoint" --identity "$key")
 }
 
@@ -160,9 +168,9 @@ host_readiness() {
         backing=$guest
     else
         machine_info=$(podman_json machine info --format json) || return
-        MACHINE=$(printf '%s' "$machine_info" | json -er '.Host.DefaultMachine | select(type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))') || return 3
+        MACHINE=$(printf '%s' "$machine_info" | podman_machine_name) || return
         [[ "$MACHINE" == "${BOUND_MACHINE:-$MACHINE}" ]] || {
-            fail 3 'default Podman machine changed during operation'; return
+            fail 3 'selected Podman machine changed during operation'; return
         }
         detail=$(podman_json machine inspect "$MACHINE") || return
         # jq orders strings and objects above numbers; check types before limits.

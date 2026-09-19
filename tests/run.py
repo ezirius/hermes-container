@@ -171,10 +171,46 @@ file_stat() {
 }
 select_workspace || exit
 [[ "$WORKSPACE_NAME" == Nala ]] || exit 1
-base_mode=777
+for base_mode in 770 775; do
+ select_workspace || exit
+done
+WORKSPACE_BASE_ALLOW_GROUP_WRITE=false
 if select_workspace; then exit 1; fi
+base_mode=755
+select_workspace || exit
+WORKSPACE_BASE_ALLOW_GROUP_WRITE=true
+base_mode=770
+# The shared-base exception must not relax the workspace's own checks.
+chmod 770 "$ACCOUNT_HOME/volume/Nala"
+if select_workspace; then exit 1; fi
+chmod 700 "$ACCOUNT_HOME/volume/Nala"
+for base_mode in 777 757; do
+ if select_workspace; then exit 1; fi
+done
 base_mode=755; base_owner=$((OPERATOR_UID+1))
 if select_workspace; then exit 1; fi
+base_owner=$OPERATOR_UID
+select_workspace || exit
+base_mode=770
+if select_workspace; then exit 1; fi
+# Root-owned metadata must not make symlinked bases eligible.
+base_owner=0; base_mode=770
+ln -s "$ACCOUNT_HOME/volume" "$ACCOUNT_HOME/volume-link"
+if safe_workspace_base "$ACCOUNT_HOME/volume-link"; then exit 1; fi
+chmod 000 "$ACCOUNT_HOME/volume"
+if safe_workspace_base "$ACCOUNT_HOME/volume"; then exit 1; fi
+chmod 700 "$ACCOUNT_HOME/volume"
+''')
+
+    def test_workspace_base_permissions_are_rechecked_after_selection(self):
+        self.shell(r'''
+load_workspace || exit
+chmod 770 "$ACCOUNT_HOME"
+verify_source_paths
+status=$?
+chmod 700 "$ACCOUNT_HOME"
+[[ $status == 4 ]] || exit 1
+verify_source_paths || exit
 ''')
 
     def test_four_mounts_and_backup_exclusions(self):
@@ -320,6 +356,21 @@ operate() { INTERRUPTED=2; return 3; }
 main setup workspace
 [[ $? == 130 ]]
 ''')
+
+    def test_main_reports_silent_failures_but_not_success_or_cancellation(self):
+        for stage in ('initialise', 'operate'):
+            for status in (0, 3, 4, 130, 143):
+                with self.subTest(stage=stage, status=status):
+                    result = self.shell('''
+initialise() { return 0; }
+operate() { return 0; }
+''' + stage + '() { return ' + str(status) + '''; }
+main setup workspace
+''', expect=status)
+                    if status in (3, 4):
+                        self.assertIn('Hermes setup failed (exit status ' + str(status) + ')', result.stderr)
+                    else:
+                        self.assertNotIn('failed', result.stderr)
 
     def test_capture_cancellation_reaps_child_without_waiting_for_timeout(self):
         self.shell(r'''
@@ -1517,11 +1568,12 @@ BOUND_MACHINE=fixture
 test_graph=/var/home/core/.local/share/containers/storage
 test_vm_workspace_visible=true
 resources='{"CPUs":2,"Memory":6144}'
+test_machine_info='{"Host":{"DefaultMachine":"fixture","MachineImageDir":"/fixture"}}'
 podman_json() {
  case "$*" in
   'version --format json') printf '{"Client":{"Version":"6.1.1"}}' ;;
   'info --format json') printf '{"version":{"Version":"6.1.1"},"host":{"os":"linux","arch":"arm64","cgroupVersion":"v2","security":{"rootless":true},"cpus":2,"memTotal":6442450944},"store":{"graphRoot":"/home/user/storage"}}' | json --arg graph "$test_graph" '.store.graphRoot=$graph' ;;
-  'machine info --format json') printf '{"Host":{"DefaultMachine":"fixture","MachineImageDir":"/fixture"}}' ;;
+  'machine info --format json') printf '%s' "$test_machine_info" ;;
   'machine inspect fixture') json -n --argjson resources "$resources" '[{Name:"fixture",State:"running",Rootful:false,Resources:$resources}]' ;;
   *) return 99 ;;
  esac
@@ -1538,6 +1590,13 @@ run_capture() {
 free_bytes() { printf '99999999999\n'; }
 image_cached() { return 0; }
 host_readiness digest || exit
+test_machine_info='{"Host":{"DefaultMachine":"","CurrentMachine":"fixture","MachineImageDir":"/fixture"}}'
+host_readiness digest || exit
+test_machine_info='{"Host":{"CurrentMachine":"fixture","MachineImageDir":"/fixture"}}'
+host_readiness digest || exit
+BOUND_MACHINE=other
+if host_readiness digest; then exit 1; fi
+BOUND_MACHINE=fixture
 original_workspace=$WORKSPACE
 WORKSPACE="$ACCOUNT_HOME/Space and ' quote \$(touch SHOULD_NOT_EXIST)"
 mkdir "$WORKSPACE" || exit
@@ -2414,6 +2473,8 @@ operate <<< 1 || exit
             ('TRUSTED_PATH=', 'TRUSTED_PATH=:'),
             ('TRUSTED_TOOL_USERS=ezirius', 'TRUSTED_TOOL_USERS=501'),
             ('TRUSTED_TOOL_USERS=ezirius', 'TRUSTED_TOOL_USERS=ezirius;root'),
+            ('WORKSPACE_BASE_ALLOW_GROUP_WRITE=true', 'WORKSPACE_BASE_ALLOW_GROUP_WRITE=yes'),
+            ('WORKSPACE_BASE_ALLOW_GROUP_WRITE=true', 'WORKSPACE_BASE_ALLOW_GROUP_WRITE='),
             ('CONTAINER_MEMORY=2g', 'CONTAINER_MEMORY=$(touch /tmp/never-execute-config)'),
             ('MIN_SERVICE_RELEASE=v2026.9.14', 'MIN_SERVICE_RELEASE=v2026.2.30'),
             ('MIN_PODMAN_ARM64=6.1.1', 'MIN_PODMAN_ARM64=6.1.1-preview'),
@@ -2426,6 +2487,21 @@ operate <<< 1 || exit
                 self.shell('load_launcher_config "$ACCOUNT_HOME/custom.conf"', expect=3,
                            setup=lambda root, value=config.replace(old, new):
                            (root/'custom.conf').write_text(value))
+
+    def test_trusted_tool_users_can_be_empty_or_multiple_names(self):
+        for users in ('', 'ezirius nala'):
+            config = (ROOT/'config/hermes-container.conf').read_text().replace(
+                'TRUSTED_TOOL_USERS=ezirius', 'TRUSTED_TOOL_USERS=' + users)
+            with self.subTest(users=users):
+                self.shell('load_launcher_config "$ACCOUNT_HOME/custom.conf"',
+                           setup=lambda root: (root/'custom.conf').write_text(config))
+        self.shell(r'''
+TRUSTED_TOOL_USERS=
+trusted_tool_owner 0 || exit
+trusted_tool_owner "$OPERATOR_UID" || exit
+OPERATOR_UID=999998
+if trusted_tool_owner "$(id -u)"; then exit 1; fi
+''')
 
     def test_launcher_config_keeps_shell_text_literal(self):
         config = (ROOT/'config/hermes-container.conf').read_text().replace(

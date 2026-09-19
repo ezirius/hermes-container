@@ -8,10 +8,11 @@ branch. Its code and records are not migrated by this launcher.
 
 All launcher settings and defaults live in `config/hermes-container.conf`. It is a plain
 `NAME=value` data file with full-line comments, not executable shell code. Every
-known key must appear once. Unknown keys, duplicates, empty values, invalid paths,
+known key must appear once. Unknown keys, duplicates, empty required values, invalid paths,
 invalid ports, invalid release dates, binary input and inconsistent timeouts are
 refused. Errors distinguish unknown names, duplicates and invalid values.
 Conflicting timeouts name the keys that need changing.
+`TRUSTED_TOOL_USERS` may be empty to disable additional trusted tool owners.
 Settings are read into one snapshot at command startup; environment values do not override
 them. `--check-config` validates the file without a terminal or Podman.
 
@@ -43,6 +44,8 @@ Success, warning and error messages, and help output, end with a blank line.
 All numbered menus, including image updates, retry invalid input and accept
 `q` or `Q` to quit. Confirmation prompts use `y`/`yes` or `Y`/`YES` to proceed;
 other answers cancel. An interrupt always cancels, even with an affirmative answer.
+Failed startup or operations print a short command/exit-status summary, even
+when a lower-level check has no diagnostic. Success and cancellation do not.
 
 Invalid arguments print an error followed by a blank line and usage on stderr,
 then return status 2 before host checks. Workspace arguments use the same name
@@ -58,9 +61,9 @@ versions are not tracked. Linux ARM is outside scope.
 
 jq, curl and Podman are found using the configured trusted search path, which
 defaults to standard Homebrew and system directories.
-Their resolved executable must be owned by root or the current user and must
-not be group/world writable. A Homebrew executable owned by another account
-can therefore be rejected even when it runs from that account's terminal.
+Their resolved executable must be owned by root, the current user or an account
+listed in `TRUSTED_TOOL_USERS` (shipped as `ezirius`), and must not be group/world
+writable. This allows the shared Homebrew installation without changing its ownership.
 The error names the tool and explains these requirements.
 
 The engine must be native rootless Linux with cgroups v2, at least 2 CPUs and
@@ -69,6 +72,9 @@ uses the local engine with `--remote=false`. macOS requires an already running,
 rootless Podman VM and a matching default connection; the connection is fixed
 for subsequent commands. The launcher does not install tools or upgrade,
 start, resize or reconfigure the VM.
+Both connection binding and storage checks use `DefaultMachine`, falling back
+to `CurrentMachine` when the default is empty or missing. A change in selected
+machine during the operation is refused. Missing names produce an explicit error.
 
 Storage checks require 3 GiB free for a cached image or 10 GiB before a pull,
 including the VM backing volume on macOS. After locking and creating missing
@@ -77,6 +83,16 @@ in all four mount sources. Markers are removed after the check. This checks visi
 not container write permissions, and does not repair VM sharing.
 
 ## Workspace paths
+
+The workspace base must be a real directory owned by root or the current user.
+`WORKSPACE_BASE_ALLOW_GROUP_WRITE=true` allows group write only on a root-owned
+base; `false` refuses group write on all bases. World write is always refused.
+The current user must have list and search access. Named ACLs can provide this
+access; the launcher does not edit ACLs or audit every ACL entry. These are Unix
+ownership/mode checks, not a guarantee of exclusive access against other users
+who have ACL permissions. Individual workspace and data checks remain stricter.
+The base permissions and access are rechecked with the source paths before
+protected operations, including after prompts and downloads.
 
 Workspaces are immediate directories under `/Volumes/Data`, owned by the current
 account. Their spelling starts with one capital letter, then lowercase letters,

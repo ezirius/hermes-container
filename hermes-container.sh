@@ -227,6 +227,10 @@ main() {
     status=$?
     # Helpers may classify a failed command, but cancellation takes precedence.
     operation_active || return
+    case "$status" in
+        0|130|143) ;; # Success or a normal cancellation.
+        *) error "Hermes $ACTION failed (exit status $status)." ;;
+    esac
     return "$status"
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

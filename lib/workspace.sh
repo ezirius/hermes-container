@@ -3,10 +3,24 @@ validate_record() { printf '%s' "$2" | "$JQ" -e --arg kind "$1" -f "$CODE_DIR/li
 workspace_base() { printf '%s\n' "$WORKSPACE_BASE"; }
 safe_workspace_base() {
     local path=$1 owner mode
-    [[ -d "$path" && ! -L "$path" ]] || return 4
+    [[ -d "$path" && ! -L "$path" ]] || {
+        fail 4 "workspace base must be an existing directory, not a symlink: $path"; return
+    }
     owner=$(file_stat owner "$path") && mode=$(file_stat mode "$path") || return
-    # A shared volume may belong to root; each workspace must still belong to you.
-    [[ "$owner" == 0 || "$owner" == "$OPERATOR_UID" ]] && (( (8#$mode & 0022) == 0 ))
+    [[ "$owner" == 0 || "$owner" == "$OPERATOR_UID" ]] || {
+        fail 4 "workspace base must belong to root or the current user (owner UID $owner): $path"; return
+    }
+    (( (8#$mode & 0002) == 0 )) || {
+        fail 4 "workspace base must not be world writable (mode $mode): $path"; return
+    }
+    if (( (8#$mode & 0020) != 0 )); then
+        [[ "$owner" == 0 && "$WORKSPACE_BASE_ALLOW_GROUP_WRITE" == true ]] || {
+            fail 4 "group-writable workspace base requires root ownership and WORKSPACE_BASE_ALLOW_GROUP_WRITE=true: $path"; return
+        }
+    fi
+    [[ -r "$path" && -x "$path" ]] || {
+        fail 4 "current user needs list and search access to workspace base: $path"; return
+    }
 }
 workspace_username() {
     local username LC_ALL=C
@@ -75,10 +89,7 @@ set_paths() {
 select_workspace() {
     local base name username answer path matched=false names=()
     base=$(workspace_base) || return
-    safe_workspace_base "$base" || {
-        fail 3 "workspace volume is missing or unsafe: $base"
-        return
-    }
+    safe_workspace_base "$base" || return 3
     for path in "$base"/*; do
         name=${path##*/}
         username=$(workspace_username "$name") && safe_path "$path" directory 2>/dev/null || continue
@@ -132,6 +143,8 @@ source_identity() {
 # Recheck both the link destinations and directory identities throughout a run.
 verify_source_paths() {
     local path index
+    # Sharing permissions can change while a menu or image download is open.
+    safe_workspace_base "${WORKSPACE%/*}" || return
     safe_path "$WORKSPACE" directory && safe_path "$USER_HOME" directory || {
         fail 4 "workspace and account home must exist: $WORKSPACE; $USER_HOME"
         return
