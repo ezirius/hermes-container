@@ -369,16 +369,24 @@ port=1234
 machine_name=test
 rootful=false
 machine_state=running
+machine_info='{"Host":{"DefaultMachine":"test","CurrentMachine":"other"}}'
 podman_json() {
  case "$1 $2" in
- 'machine info') printf '{"Host":{"DefaultMachine":"test"}}' ;;
- 'machine inspect') json -n --arg name "$machine_name" --arg state "$machine_state" --argjson rootful "$rootful" '[{Name:$name,State:$state,Rootful:$rootful,SSHConfig:{RemoteUsername:"core",Port:1234,IdentityPath:"/tmp/key"}}]' ;;
+ 'machine info') printf '%s' "$machine_info" ;;
+ 'machine inspect') [[ "$3" == test ]] || return 99; json -n --arg name "$machine_name" --arg state "$machine_state" --argjson rootful "$rootful" '[{Name:$name,State:$state,Rootful:$rootful,SSHConfig:{RemoteUsername:"core",Port:1234,IdentityPath:"/tmp/key"}}]' ;;
  'system connection') json -n --arg uri "ssh://core@127.0.0.1:$port/run/user/501/podman/podman.sock" '[{Default:true,IsMachine:true,URI:$uri,Identity:"/tmp/key"}]' ;;
  *) return 99 ;;
  esac
 }
 bind_machine_connection || exit
 [[ ${PODMAN_OPTIONS[0]} == --url && ${PODMAN_OPTIONS[3]} == /tmp/key ]] || exit
+for machine_info in \
+ '{"Host":{"DefaultMachine":"","CurrentMachine":"test"}}' \
+ '{"Host":{"CurrentMachine":"test"}}' \
+ '{"Host":{"DefaultMachine":null,"CurrentMachine":"test"}}'; do
+ bind_machine_connection || exit
+ [[ "$BOUND_MACHINE" == test ]] || exit 1
+done
 port=9999
 if bind_machine_connection; then exit 1; fi
 port=1234
@@ -391,6 +399,18 @@ rootful=false
 machine_state=stopped
 if bind_machine_connection; then exit 1; fi
 ''')
+
+    def test_missing_or_invalid_machine_name_reports_error(self):
+        for host in ({}, {'DefaultMachine': '', 'CurrentMachine': ''},
+                     {'DefaultMachine': '', 'CurrentMachine': '../invalid'},
+                     {'DefaultMachine': False, 'CurrentMachine': 'test'}):
+            with self.subTest(host=host):
+                info = shlex.quote(json.dumps({'Host': host}))
+                result = self.shell('''
+podman_json() { printf '%s' ''' + info + '''; }
+bind_machine_connection
+''', expect=3)
+                self.assertIn('must identify a valid default or current machine', result.stderr)
 
     def test_session_cancellation_keeps_status_and_residual_marker(self):
         self.shell(r'''

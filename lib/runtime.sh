@@ -3,8 +3,13 @@
 bind_machine_connection() {
     local machines detail connections endpoint key
     machines=$(podman_json machine info --format json) || return
+    # Podman 5.8.3 can report an empty DefaultMachine with a valid CurrentMachine.
     BOUND_MACHINE=$(printf '%s' "$machines" | json -er '
-        .Host.DefaultMachine | select(type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))') || return 3
+        .Host | if .DefaultMachine == null or .DefaultMachine == ""
+        then .CurrentMachine else .DefaultMachine end
+        | select(type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))') || {
+        fail 3 'Podman machine info must identify a valid default or current machine'; return
+    }
     detail=$(podman_json machine inspect "$BOUND_MACHINE") || return
     connections=$(podman_json system connection list --format json) || return
     endpoint=$(printf '%s' "$connections" | json -er --arg name "$BOUND_MACHINE" --argjson machine "$detail" '
@@ -19,7 +24,7 @@ bind_machine_connection() {
              and (.port|tonumber)==$machine[0].SSHConfig.Port
              and $connection.Identity==$machine[0].SSHConfig.IdentityPath
           then $connection.URI else error("connection differs from machine") end') || {
-        fail 3 'default Podman connection must use the default rootless machine'; return
+        fail 3 'default Podman connection must use the selected running rootless machine'; return
     }
     key=$(printf '%s' "$detail" | json -er '.[0].SSHConfig.IdentityPath | select(type=="string" and startswith("/"))') || return 3
     PODMAN_OPTIONS=(--url "$endpoint" --identity "$key")
