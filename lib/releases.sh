@@ -12,25 +12,25 @@ validate_http_headers() {
 http_get() {
     local url=$1 accept=$2 token=${3:-} config headers status seconds
     case "$url" in
-        https://api.github.com/repos/NousResearch/hermes-agent/releases\?*) ;;
-        https://auth.docker.io/token\?service=registry.docker.io\&scope=repository:nousresearch/hermes-agent:pull) ;;
-        https://registry-1.docker.io/v2/nousresearch/hermes-agent/manifests/*) ;;
+        "$RELEASE_URL"\?*) ;;
+        "$REGISTRY_AUTH_URL") ;;
+        "$REGISTRY_URL"/*) ;;
         *) return 4 ;;
     esac
     seconds=$((HTTP_DEADLINE-SECONDS)); ((seconds>0)) || return 3
     config=$(/usr/bin/mktemp "$SCRATCH/curl.XXXXXXXX") || return
     headers=$(/usr/bin/mktemp "$SCRATCH/headers.XXXXXXXX") || return
     if [[ -n "$token" ]]; then
-        [[ "$token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] && ((${#token}<=8192)) || return 4
+        [[ "$token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] && ((${#token}<=MAX_TOKEN_BYTES)) || return 4
         printf 'header = "Authorization: Bearer %s"\n' "$token" > "$config" || return
     fi
-    run_capture "$seconds" "$CURL" -q --config "$config" --silent --show-error --http1.1 --proto '=https' --connect-timeout 3 --max-time "$seconds" --max-filesize 8388608 --dump-header "$headers" --header "Accept: $accept" "$url"
+    run_capture "$seconds" "$CURL" -q --config "$config" --silent --show-error --http1.1 --proto '=https' --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$seconds" --max-filesize "$MAX_JSON_BYTES" --dump-header "$headers" --header "Accept: $accept" "$url"
     status=$?
     /bin/rm "$config" || return
     operation_active || return
     # A size-limit refusal is bad input, not an offline release check. curl can
     # reject Content-Length before downloading, or our capture limit can stop it.
-    if ((status==63)) || ! capture_within_limits || (( $(file_stat size "$headers") > 65536 )); then
+    if ((status==63)) || ! capture_within_limits || (( $(file_stat size "$headers") > MAX_HTTP_HEADER_BYTES )); then
         fail 4 'release response exceeded the allowed size'; return
     fi
     ((status==0)) || return 3
@@ -47,22 +47,23 @@ release_key() {
       | if .y<1 or .m<1 or .m>12 or .d<1 or .d>([31,$feb,31,30,31,30,31,31,30,31,30,31][.m-1]) or .p>9999 then error("invalid release date") else .y*100000000+.m*1000000+.d*10000+.p end'
 }
 github_releases() {
-    local url='https://api.github.com/repos/NousResearch/hermes-agent/releases?per_page=100' page=1 all='[]' next tag key
-    HTTP_DEADLINE=$((SECONDS+10))
+    local url="$RELEASE_URL?per_page=$RELEASE_PAGE_SIZE" page=1 all='[]' next tag key
+    HTTP_DEADLINE=$((SECONDS+RELEASE_TIMEOUT))
     while :; do
         http_get "$url" application/vnd.github+json || return
         [[ "$HTTP_TYPE" == application/json || "$HTTP_TYPE" == application/vnd.github+json ]] || return 4
-        printf '%s' "$HTTP_BODY" | json -e 'type=="array" and length<=100 and all(.[]; (.id|type)=="number" and (.id|floor)==.id and .id>0 and (.draft|type)=="boolean" and (.prerelease|type)=="boolean")' >/dev/null || return 4
+        printf '%s' "$HTTP_BODY" | json -e --argjson page_size "$RELEASE_PAGE_SIZE" 'type=="array" and length<=$page_size and all(.[]; (.id|type)=="number" and (.id|floor)==.id and .id>0 and (.draft|type)=="boolean" and (.prerelease|type)=="boolean")' >/dev/null || return 4
         all=$(printf '%s' "$all" | json --argjson page "$HTTP_BODY" '.+$page') || return
         printf '%s' "$all" | json -e '[.[].id] | length == (unique|length)' >/dev/null || return 4
         [[ -n "$HTTP_LINK" ]] || break
-        next=$(printf '%s' "$HTTP_LINK" | json -Rer --argjson page "$((page+1))" '
-          split(",") | map([capture("^ *<(?<url>https://api\\.github\\.com/repos/NousResearch/hermes-agent/releases\\?[^>]+)> *; *rel=\"(?<rel>next|prev|first|last)\" *$")] | if length==1 then .[0] else error("malformed pagination") end)
+        next=$(printf '%s' "$HTTP_LINK" | json -Rer --arg base "$RELEASE_URL?" '
+          split(",") | map([capture("^ *<(?<url>[^>]+)> *; *rel=\"(?<rel>next|prev|first|last)\" *$")] | if length==1 then .[0] else error("malformed pagination") end)
+          | if all(.[]; .url | startswith($base)) then . else error("foreign pagination URL") end
           | if ([.[].rel]|length!=(unique|length)) then error("duplicate link") else . end
           | map(select(.rel=="next")) | if length==0 then "" elif length!=1 then error("next") else .[0].url end') || return 4
         [[ -n "$next" ]] || break
         page=$((page+1))
-        [[ "$next" == "https://api.github.com/repos/NousResearch/hermes-agent/releases?per_page=100&page=$page" || "$next" == "https://api.github.com/repos/NousResearch/hermes-agent/releases?page=$page&per_page=100" ]] || return 4
+        [[ "$next" == "$RELEASE_URL?per_page=$RELEASE_PAGE_SIZE&page=$page" || "$next" == "$RELEASE_URL?page=$page&per_page=$RELEASE_PAGE_SIZE" ]] || return 4
         url=$next
     done
     all=$(printf '%s' "$all" | json '[.[] | select(.draft==false and .prerelease==false)]') || return
@@ -78,7 +79,7 @@ github_releases() {
 registry_children() {
     local tag=$1 token=$2
     release_key "$tag" >/dev/null || return 4
-    http_get "https://registry-1.docker.io/v2/nousresearch/hermes-agent/manifests/$tag" 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' "$token" || return
+    http_get "$REGISTRY_URL/$tag" 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' "$token" || return
     [[ "$HTTP_TYPE" == application/vnd.oci.image.index.v1+json || "$HTTP_TYPE" == application/vnd.docker.distribution.manifest.list.v2+json ]] || return 4
     printf '%s' "$HTTP_BODY" | json -e '
       if .schemaVersion!=2 or (.manifests|type)!="array" then error("index") else . end
@@ -99,8 +100,8 @@ registry_children() {
 resolve_online() {
     local current=$1 newest token children current_children tag
     newest=$(github_releases) || return
-    HTTP_DEADLINE=$((SECONDS+10))
-    http_get 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:nousresearch/hermes-agent:pull' application/json || return
+    HTTP_DEADLINE=$((SECONDS+RELEASE_TIMEOUT))
+    http_get "$REGISTRY_AUTH_URL" application/json || return
     [[ "$HTTP_TYPE" == application/json ]] || return 4
     token=$(printf '%s' "$HTTP_BODY" | json -er 'if .token!=null and .access_token!=null and .token!=.access_token then error("ambiguous token") else .token // .access_token end | select(type=="string")') || return 4
     if [[ "$current" != null ]]; then
@@ -127,7 +128,7 @@ choose_image() {
             SELECTED=$current; return
         fi
         if ((status==3)); then
-            error 'Release check unavailable; first setup/import needs an online image selection. Try again when GitHub and Docker Hub are reachable.'
+            error 'Release check unavailable; first setup/restore needs an online image selection. Try again when GitHub and Docker Hub are reachable.'
         elif ((status==4)); then
             # Some schema checks return only a status. Always explain the stop.
             error 'Release check returned invalid or inconsistent metadata; cannot continue.'

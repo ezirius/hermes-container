@@ -15,15 +15,21 @@ type=="array" and length==1 and (.[0] |
   # Reuse must keep tools in this container and in the selected Agent Docs.
   and (.Config.Env | environment and index("HERMES_DASHBOARD=1")!=null
     and index("HERMES_DASHBOARD_HOST=0.0.0.0")!=null
-    and index("HERMES_DASHBOARD_PORT=9119")!=null
+    and index("HERMES_DASHBOARD_PORT="+$container_port)!=null
     and index("HERMES_UID="+$uid)!=null and index("HERMES_GID="+$gid)!=null
     and index("TERMINAL_ENV=local")!=null
     and index("TERMINAL_CWD="+$docs_target)!=null
     and index("HERMES_WRITE_SAFE_ROOT="+$docs_target)!=null)
+  and .HostConfig.Memory==$memory and .HostConfig.ShmSize==$shm
+  and (.HostConfig | if .NanoCpus!=null and .NanoCpus!=0
+       then .NanoCpus==($cpus*1000000000)
+       else (.CpuPeriod|type)=="number" and .CpuPeriod>0
+         and (.CpuPeriod|floor)==.CpuPeriod
+         and (.CpuQuota|type)=="number" and .CpuQuota==($cpus*.CpuPeriod) end)
   and .HostConfig.AutoRemove==false
   and .HostConfig.Privileged==false
-  and .HostConfig.RestartPolicy.Name=="unless-stopped"
-  and .HostConfig.PortBindings=={"9119/tcp":[{HostIp:"127.0.0.1",HostPort:$port}]}
+  and .HostConfig.RestartPolicy.Name==$restart
+  and .HostConfig.PortBindings=={($container_port+"/tcp"):[{HostIp:"127.0.0.1",HostPort:$port}]}
   and ([.Mounts[] | {Source,Destination}] | sort_by(.Destination))==$mounts
   and all(.Mounts[]; .Type=="bind" and .RW==true)
   and (.State.Status|type)=="string"

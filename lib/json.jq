@@ -20,7 +20,7 @@ def value($depth):
     | if peek == "]" then next
       elif peek == "," then next | elements
       else error("invalid JSON array") end;
-  if $depth > 64 then error("JSON nesting exceeds 64")
+  if $depth > $max_depth then error("JSON nesting exceeds configured limit")
   elif peek == "{" then
     next | if peek == "}" then next else members({}) end
   elif peek == "[" then
@@ -29,7 +29,7 @@ def value($depth):
   elif (peek | test("^(true|false|null)$|^\"|^-?[0-9]")) then next
   else error("invalid JSON value") end;
 . as $raw
-| if utf8bytelength > 8388608 then error("JSON exceeds 8 MiB") else . end
+| if utf8bytelength > $max_bytes then error("JSON exceeds configured size limit") else . end
 | [scan("\"(?:[^\"\\\\\u0000-\u001f]|\\\\(?:[\"\\\\/bfnrt]|u[0-9a-fA-F]{4}))*\"|-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\\[\\],:]|[ \\t\\r\\n]+")]
 | if join("") != $raw then error("invalid JSON token") else . end
 | {tokens: map(select(test("^[ \\t\\r\\n]+$") | not)), position: 0}

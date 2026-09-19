@@ -1,6 +1,6 @@
 validate_record() { printf '%s' "$2" | "$JQ" -e --arg kind "$1" -f "$CODE_DIR/lib/records.jq" >/dev/null; }
 # Workspace folders start with one capital; the login name is all lowercase.
-workspace_base() { printf '/Volumes/Data\n'; }
+workspace_base() { printf '%s\n' "$WORKSPACE_BASE"; }
 safe_workspace_base() {
     local path=$1 owner mode
     [[ -d "$path" && ! -L "$path" ]] || return 4
@@ -14,6 +14,23 @@ workspace_username() {
     username=$(printf '%s' "$1" | LC_ALL=C /usr/bin/tr '[:upper:]' '[:lower:]') || return
     printf '%s\n' "$username"
 }
+# Add parents from the root outward so mkdir never needs an unchecked -p.
+add_source_parents() {
+    local root=$1 parent=${2%/*} existing missing=()
+    [[ "$root" == /* && "$root" != / && "$root" != */ && "$2" == "$root/"* ]] || {
+        fail 4 "source directory must be below its workspace or account home: $2"; return
+    }
+    while [[ "$parent" != "$root" ]]; do
+        missing=("$parent" "${missing[@]}")
+        parent=${parent%/*}
+    done
+    for parent in "${missing[@]}"; do
+        for existing in "${SOURCE_PARENTS[@]}"; do
+            [[ "$parent" != "$existing" ]] || continue 2
+        done
+        SOURCE_PARENTS[${#SOURCE_PARENTS[@]}]=$parent
+    done
+}
 set_paths() {
     WORKSPACE=$1
     WORKSPACE_NAME=${WORKSPACE##*/}
@@ -24,10 +41,10 @@ set_paths() {
     }
     # Read the real account home, including on Linux; never guess it from a name.
     USER_HOME=$ACCOUNT_HOME
-    HOME_SOURCE="$WORKSPACE/Apps Data/Hermes/Home"
-    BACKUPS_SOURCE="$WORKSPACE/Apps Data/Hermes/Backups"
-    DOCS_SOURCE="$WORKSPACE/Apps Data/Hermes/Agent Docs"
-    USER_DOCS_SOURCE="$USER_HOME/Documents/$WORKSPACE_NAME/Apps Data/Hermes/User Docs"
+    HOME_SOURCE="$WORKSPACE/${HOME_PATH//\{workspace\}/$WORKSPACE_NAME}"
+    BACKUPS_SOURCE="$WORKSPACE/${BACKUPS_PATH//\{workspace\}/$WORKSPACE_NAME}"
+    DOCS_SOURCE="$WORKSPACE/${AGENT_DOCS_PATH//\{workspace\}/$WORKSPACE_NAME}"
+    USER_DOCS_SOURCE="$USER_HOME/${USER_DOCS_PATH//\{workspace\}/$WORKSPACE_NAME}"
     # Podman receives real host paths; container Docs keep their familiar names.
     HERMES_DATA=$(canonical_path "$HOME_SOURCE") || return
     DOCUMENTS=$(canonical_path "$DOCS_SOURCE") || return
@@ -35,12 +52,11 @@ set_paths() {
     # Docs keep the same absolute paths on the host and inside the container.
     CONTAINER_DOCS=$DOCS_SOURCE
     CONTAINER_USER_DOCS=$USER_DOCS_SOURCE
-    SOURCE_PARENTS=(
-        "$WORKSPACE/Apps Data" "$WORKSPACE/Apps Data/Hermes"
-        "$USER_HOME/Documents" "$USER_HOME/Documents/$WORKSPACE_NAME"
-        "$USER_HOME/Documents/$WORKSPACE_NAME/Apps Data"
-        "$USER_HOME/Documents/$WORKSPACE_NAME/Apps Data/Hermes"
-    )
+    SOURCE_PARENTS=()
+    add_source_parents "$WORKSPACE" "$HOME_SOURCE" || return
+    add_source_parents "$WORKSPACE" "$BACKUPS_SOURCE" || return
+    add_source_parents "$WORKSPACE" "$DOCS_SOURCE" || return
+    add_source_parents "$USER_HOME" "$USER_DOCS_SOURCE" || return
     SOURCE_PIN_PATHS=(); SOURCE_PIN_IDS=()
     METADATA=$WORKSPACE/.hermesagent
     LEGACY_STATE=$METADATA/bash/state.json
@@ -188,8 +204,13 @@ first_data_entry() {
 require_empty_home() {
     [[ -d "$HERMES_DATA" ]] || return 0
     local entry
+    # Backups belong beside Home. Preserve any old path for manual migration.
+    if exists "$HERMES_DATA/backups"; then
+        fail 4 "Home/backups already exists; inspect or migrate it manually before first setup: $HERMES_DATA/backups (use $BACKUPS for backups)"
+        return
+    fi
     # An unreadable directory is unknown, not empty. Check find's status too.
-    entry=$(first_data_entry "$HERMES_DATA" ! -name backups) || {
+    entry=$(first_data_entry "$HERMES_DATA") || {
         fail 4 "cannot inspect Hermes Home: $HERMES_DATA"
         return
     }
@@ -198,7 +219,7 @@ require_empty_home() {
         fail 4 "Hermes Home must be empty before first setup; existing entry: $(printf '%s' "$entry" | json -Rs .)"
         return
     fi
-    # Existing backups are allowed so first setup can offer an import.
+    # Existing archives in the separate Backups directory can be restored.
     if exists "$BACKUPS"; then
         safe_path "$BACKUPS" directory 700 || return
     fi
@@ -231,7 +252,7 @@ read_image() {
     local value
     if ! exists "$IMAGE_FILE"; then printf 'null\n'; return; fi
     safe_path "$IMAGE_FILE" file 600 || return
-    (( $(file_stat size "$IMAGE_FILE") <= 8388608 )) || return 4
+    (( $(file_stat size "$IMAGE_FILE") <= MAX_JSON_BYTES )) || return 4
     value=$(strict_json < "$IMAGE_FILE") && validate_record image "$value" || {
         fail 4 "invalid image configuration: $IMAGE_FILE"; return
     }
@@ -258,7 +279,7 @@ load_workspace() {
     IMAGE_CONFIG=$(read_image) || return
     MIGRATION_IMAGE=null; LEGACY_RECORD=
     if [[ "$IMAGE_CONFIG" == null ]]; then
-        [[ "$ACTION" == setup || "$ACTION" == import ]] || { fail 4 'run setup first to select an image'; return; }
+        [[ "$ACTION" == setup || "$ACTION" == restore ]] || { fail 4 'run setup first to select an image'; return; }
         if exists "$METADATA"; then
             safe_path "$METADATA/bash" directory 700 || return
             LEGACY_RECORD=$(read_record "$LEGACY_STATE") || return
@@ -267,7 +288,7 @@ load_workspace() {
             MIGRATION_IMAGE=$(printf '%s' "$LEGACY_RECORD" | json '(.pending.target // .accepted) | if .==null then null else {tag,platform,digest} end') || return
         fi
         if [[ "$MIGRATION_IMAGE" == null ]]; then
-            # Existing backups can be chosen from the first-setup import menu.
+            # Existing backups can be chosen from the first-setup restore menu.
             require_empty_home || return
         fi
     fi

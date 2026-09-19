@@ -108,8 +108,28 @@ require_cached_image() {
 free_bytes() {
     /bin/df -Pk "$1" | /usr/bin/awk 'NR==2 && NF>=6 && $4 ~ /^[0-9]+$/ {printf "%.0f\n", $4*1024}'
 }
+# Stay within the exact integer range used by JSON and shell calculations.
+# This is a numeric format boundary, not a storage policy or configurable limit.
+valid_byte_count() {
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,15})$ ]] && (($1<=9007199254740991))
+}
+require_disk_space() {
+    local directory=$1 bytes=$2 copies=$3 reserve_gib=$4 available reserve
+    valid_byte_count "$bytes" && [[ "$copies" =~ ^[12]$ && "$reserve_gib" =~ ^[1-9][0-9]{0,5}$ ]] || {
+        fail 3 "cannot establish a safe data size for $directory"; return
+    }
+    available=$(free_bytes "$directory") || {
+        fail 3 "cannot read free space in $directory"; return
+    }
+    valid_byte_count "$available" || { fail 3 "invalid free-space result for $directory"; return; }
+    reserve=$((reserve_gib*1073741824))
+    # Divide available space instead of multiplying an untrusted archive size.
+    ((available>=reserve && bytes<=(available-reserve)/copies)) || {
+        fail 3 "insufficient free space in $directory for data plus $reserve_gib GiB reserve"; return
+    }
+}
 host_readiness() {
-    local digest=$1 version info client_version engine_version machine_info detail graph backing guest required=10737418240 status
+    local digest=$1 version info client_version engine_version machine_info detail graph backing guest required=$((NEW_IMAGE_FREE_GIB*1073741824)) status quoted
     version=$(podman_json version --format json) || return
     client_version=$(printf '%s' "$version" | json -er '.Client.Version | select(type=="string")') || return 3
     version_at_least "$client_version" "$REQUIRED_PODMAN" || {
@@ -120,12 +140,13 @@ host_readiness() {
     version_at_least "$engine_version" "$REQUIRED_PODMAN" || {
         fail 3 "Podman engine $REQUIRED_PODMAN or newer is required; found $engine_version"; return
     }
-    printf '%s' "$info" | json -e --arg native "$NATIVE" '
+    printf '%s' "$info" | json -e --arg native "$NATIVE" --argjson cpus "$MIN_ENGINE_CPUS" \
+      --argjson memory "$((MIN_ENGINE_MEMORY_MIB*1048576))" '
       .host.os=="linux" and .host.arch==$native
       and .host.cgroupVersion=="v2" and .host.security.rootless==true
-      and (.host.cpus|type)=="number" and (.host.cpus|floor)==.host.cpus and .host.cpus>=2
+      and (.host.cpus|type)=="number" and (.host.cpus|floor)==.host.cpus and .host.cpus>=$cpus
       and (.host.memTotal|type)=="number" and (.host.memTotal|floor)==.host.memTotal
-      and .host.memTotal>=6442450944' >/dev/null || { fail 3 "engine must be native/rootless Linux, version $REQUIRED_PODMAN or newer, cgroups v2, 2 CPUs and 6 GiB"; return; }
+      and .host.memTotal>=$memory' >/dev/null || { fail 3 "engine must be native/rootless Linux, version $REQUIRED_PODMAN or newer, cgroups v2, $MIN_ENGINE_CPUS CPUs and $MIN_ENGINE_MEMORY_MIB MiB"; return; }
     graph=$(printf '%s' "$info" | json -er '.store.graphRoot | select(type=="string" and startswith("/"))') || return 3
     if [[ "$HOST_OS" == Linux ]]; then
         printf '%s' "$info" | json -e '.host.serviceIsRemote==false' >/dev/null || { fail 3 'Linux requires the local Podman engine'; return; }
@@ -140,37 +161,39 @@ host_readiness() {
         }
         detail=$(podman_json machine inspect "$MACHINE") || return
         # jq orders strings and objects above numbers; check types before limits.
-        printf '%s' "$detail" | json -e --arg machine "$MACHINE" '
+        printf '%s' "$detail" | json -e --arg machine "$MACHINE" --argjson cpus "$MIN_ENGINE_CPUS" \
+          --argjson memory "$MIN_ENGINE_MEMORY_MIB" '
           type=="array" and length==1 and .[0].Name==$machine
           and .[0].State=="running" and .[0].Rootful==false
           and (.[0].Resources.CPUs|type)=="number"
-          and (.[0].Resources.CPUs|floor)==.[0].Resources.CPUs and .[0].Resources.CPUs>=2
+          and (.[0].Resources.CPUs|floor)==.[0].Resources.CPUs and .[0].Resources.CPUs>=$cpus
           and (.[0].Resources.Memory|type)=="number"
-          and (.[0].Resources.Memory|floor)==.[0].Resources.Memory and .[0].Resources.Memory>=6144
-        ' >/dev/null || { fail 3 'Podman machine resources are invalid or below 2 CPUs and 6 GiB'; return; }
+          and (.[0].Resources.Memory|floor)==.[0].Resources.Memory and .[0].Resources.Memory>=$memory
+        ' >/dev/null || { fail 3 "Podman machine resources are invalid or below $MIN_ENGINE_CPUS CPUs and $MIN_ENGINE_MEMORY_MIB MiB"; return; }
         # machine ssh crosses a shell boundary. Allow hidden directories such as
         # .local, but refuse shell punctuation and whitespace before passing a path.
         [[ "$graph" =~ ^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?$ ]] || {
             fail 3 "unsupported Podman guest storage path: $graph"; return
         }
-        run_capture 10 "$PODMAN" machine ssh "$MACHINE" df -Pk "$graph" || {
+        run_capture "$INSPECT_TIMEOUT" "$PODMAN" machine ssh "$MACHINE" df -Pk "$graph" || {
             fail 3 'could not check free space inside the Podman VM'; return
         }
         guest=$(/usr/bin/awk 'NR==2 && NF==6 && $4 ~ /^[0-9]+$/ {printf "%.0f\n",$4*1024}' "$CAPTURE_OUT")
         backing=$(printf '%s' "$machine_info" | json -er '.Host.MachineImageDir | select(type=="string" and startswith("/"))') || return 3
         backing=$(free_bytes "$backing") || return
     fi
-    [[ "$guest" =~ ^[0-9]+$ && "$backing" =~ ^[0-9]+$ ]] || {
+    valid_byte_count "$guest" && valid_byte_count "$backing" || {
         fail 3 'could not read available Podman storage from df output'; return
     }
     image_cached "$digest"; status=$?
-    if ((status==0)); then required=3221225472; elif ((status!=1)); then return "$status"; fi
+    if ((status==0)); then required=$((CACHED_IMAGE_FREE_GIB*1073741824)); elif ((status!=1)); then return "$status"; fi
     ((backing>=required && guest>=required)) || { fail 3 'insufficient Podman storage'; return; }
     if [[ "$HOST_OS" == Darwin ]]; then
         # Remote Podman mounts paths from the VM, not directly from macOS.
-        # WORKSPACE comes from the fixed base and the validated workspace name.
-        run_capture 10 "$PODMAN" machine ssh "$MACHINE" /usr/bin/test -d "$WORKSPACE" || {
-            fail 3 "workspace is not accessible inside the Podman VM; check its /Volumes/Data share: $WORKSPACE"
+        # machine ssh joins arguments into shell text: quote configured paths.
+        quoted=${WORKSPACE//\'/\'\\\'\'}
+        run_capture "$INSPECT_TIMEOUT" "$PODMAN" machine ssh "$MACHINE" "test -d '$quoted'" || {
+            fail 3 "workspace is not accessible inside the Podman VM; check its configured share: $WORKSPACE"
             return
         }
     fi
@@ -191,7 +214,7 @@ verify_vm_shares() {
         # including embedded apostrophes, rather than relying on argv boundaries.
         quoted=${marker//\'/\'\\\'\'}
         command="test \"\$(cat '$quoted')\" = '$token'"
-        run_capture 10 "$PODMAN" machine ssh "$MACHINE" "$command"
+        run_capture "$INSPECT_TIMEOUT" "$PODMAN" machine ssh "$MACHINE" "$command"
         status=$?
         # The guest only reads the marker, so a timed-out read cannot recreate it.
         safe_path "$marker" file 600 && [[ "$(identity "$marker")" == "$marker_id" ]] || return 4
@@ -215,7 +238,7 @@ ensure_image() {
         return
     fi
     verify_lock || return
-    run_capture 1800 "$PODMAN" "${PODMAN_OPTIONS[@]}" pull --tls-verify=true "$IMAGE@$digest"
+    run_capture "$PULL_TIMEOUT" "$PODMAN" "${PODMAN_OPTIONS[@]}" pull --tls-verify=true "$IMAGE@$digest"
     status=$?
     # Cancellation is not a pull failure. Otherwise name the failed operation
     # before temporary command output is removed during exit cleanup.
@@ -244,7 +267,7 @@ gateway_guard() {
         path=$root/gateway_state.json
         exists "$path" || continue
         safe_path "$path" file || return
-        (( $(file_stat size "$path") <= 8388608 )) || return 4
+        (( $(file_stat size "$path") <= MAX_JSON_BYTES )) || return 4
         record=$(strict_json < "$path") || return 4
         printf '%s' "$record" | json -e --arg mode "$mode" '
           type=="object" and ((if .desired_state!=null then .desired_state else .gateway_state end) as $s
@@ -253,15 +276,14 @@ gateway_guard() {
     done
 }
 dashboard_port() {
-    # Offset the host port by account; the container keeps Hermes' default 9119.
-    local account offset
+    local entry fallback= account entries
     account=$(printf '%s' "$ACCOUNT_USER" | /usr/bin/tr '[:upper:]' '[:lower:]')
-    case "$account" in
-        ezirius) offset=10000 ;;
-        nala) offset=20000 ;;
-        *) offset=50000 ;;
-    esac
-    printf '%s\n' "$((9119+offset))"
+    read -r -a entries <<< "$DASHBOARD_PORTS"
+    for entry in "${entries[@]}"; do
+        if [[ "${entry%:*}" == "$account" ]]; then printf '%s\n' "${entry##*:}"; return; fi
+        [[ "${entry%:*}" != default ]] || fallback=${entry##*:}
+    done
+    printf '%s\n' "$fallback"
 }
 container_slug() {
     printf '%s' "$WORKSPACE_ARGUMENT" | /usr/bin/tr '[:upper:]' '[:lower:]' | /usr/bin/tr -cd 'a-z0-9' | /usr/bin/cut -c1-24
@@ -282,14 +304,14 @@ build_runtime() {
     RUNTIME=(run)
     if [[ "$action" == service ]]; then
         SERVICE_NAME=$name
-        RUNTIME+=(-d --restart=unless-stopped)
+        RUNTIME+=(-d --restart="$RESTART_POLICY")
     else
         RUNTIME+=(--rm)
     fi
     RUNTIME+=(
         --pull=never --image-volume=ignore --http-proxy=false
         --name "$name" --cidfile "$run_dir/cid" --platform "linux/$NATIVE"
-        --cpus 1 --memory 2g --shm-size 512m
+        --cpus "$CONTAINER_CPUS" --memory "$CONTAINER_MEMORY" --shm-size "$CONTAINER_SHM_SIZE"
     )
     # The entrypoint starts as namespace root, then drops to HERMES_UID/GID.
     # keep-id makes that final identity map back to the host account on Linux.
@@ -312,7 +334,8 @@ build_runtime() {
     if [[ "$action" == service ]]; then
         # The official image supervises gateway and dashboard together.
         RUNTIME+=(--env HERMES_DASHBOARD=1 --env HERMES_DASHBOARD_HOST=0.0.0.0
-            --env HERMES_DASHBOARD_PORT=9119 --publish "127.0.0.1:$(dashboard_port):9119")
+            --env "HERMES_DASHBOARD_PORT=$DASHBOARD_CONTAINER_PORT"
+            --publish "127.0.0.1:$(dashboard_port):$DASHBOARD_CONTAINER_PORT")
     else
         RUNTIME+=(--env HERMES_DASHBOARD=0)
     fi
@@ -360,12 +383,11 @@ run_session() {
     operation_active || return
     RESIDUAL_UNKNOWN=true
     # Explicitly keep terminal input: asynchronous shell commands otherwise use /dev/null.
-    /usr/bin/env -i "${CHILD_ENV[@]}" TERM="${TERM:-xterm}" "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}" <&0 &
+    /usr/bin/env -i "${CHILD_ENV[@]}" TERM="${TERM:-$DEFAULT_TERM}" "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}" <&0 &
     CHILD_PID=$!
     wait "$CHILD_PID"; status=$?
     if [[ -n "$INTERRUPTED" ]]; then
-        signal_child "$INTERRUPTED"
-        while kill -0 "$CHILD_PID" 2>/dev/null; do wait "$CHILD_PID" 2>/dev/null; done
+        finish_child "$INTERRUPTED"
         status=$((128+INTERRUPTED))
     fi
     CHILD_PID=

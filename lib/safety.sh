@@ -34,12 +34,12 @@ check_jq() {
     # Apple's suffix identifies its packaged stable build.
     if [[ "$version" == jq-* ]]; then
         local release=${version#jq-}
-        version_at_least "${release%-apple}" 1.7 && return 0
+        version_at_least "${release%-apple}" "$MIN_JQ" && return 0
     fi
-    fail 3 "jq 1.7 or newer is required; found $version"
+    fail 3 "jq $MIN_JQ or newer is required; found $version"
 }
 json() { "$JQ" -cS "$@"; }
-strict_json() { "$JQ" -RscS -f "$CODE_DIR/lib/json.jq"; }
+strict_json() { "$JQ" -RscS --argjson max_bytes "$MAX_JSON_BYTES" --argjson max_depth "$MAX_JSON_DEPTH" -f "$CODE_DIR/lib/json.jq"; }
 identity() { file_stat identity "$1"; }
 sha256() {
     if [[ "$HOST_OS" == Linux ]]; then /usr/bin/sha256sum "$@"; else /usr/bin/shasum -a 256 "$@"; fi
@@ -52,14 +52,14 @@ canonical_path() {
     local path=$1 parent tail target count=${2:-0}
     [[ "$path" == /* ]] || return 1
     # Share the traversal limit with parent calls: links can cycle through parents.
-    if ((count >= 64)); then
-        fail 4 "path resolution exceeded 64 steps (possible symlink loop): $path"
+    if ((count >= MAX_PATH_STEPS)); then
+        fail 4 "path resolution exceeded $MAX_PATH_STEPS steps (possible symlink loop): $path"
         return
     fi
     while [[ -L "$path" ]]; do
         ((count += 1))
-        if ((count > 64)); then
-            fail 4 "path resolution exceeded 64 steps (possible symlink loop): $path"
+        if ((count > MAX_PATH_STEPS)); then
+            fail 4 "path resolution exceeded $MAX_PATH_STEPS steps (possible symlink loop): $path"
             return
         fi
         target=$(/usr/bin/readlink "$path") || return
@@ -74,7 +74,10 @@ canonical_path() {
 safe_path() {
     local path=$1 kind=$2 exact=${3:-} owner mode
     [[ ! -L "$path" ]] || { fail 4 "symlink refused: $path"; return; }
-    case "$kind" in directory) [[ -d "$path" ]] ;; file) [[ -f "$path" ]] ;; *) return 4 ;; esac || return 4
+    case "$kind" in directory) [[ -d "$path" ]] ;; file) [[ -f "$path" ]] ;; *) return 4 ;; esac || {
+        fail 4 "required $kind is missing, inaccessible or the wrong type: $path"
+        return
+    }
     owner=$(file_stat owner "$path") || return
     mode=$(file_stat mode "$path") || return
     [[ "$owner" == "$OPERATOR_UID" ]] && (( (8#$mode & 0022) == 0 )) || { fail 4 "unsafe ownership/mode: $path"; return; }
@@ -88,7 +91,7 @@ read_record() {
     local path=$1 value raw size
     safe_path "$path" file 600 || return
     size=$(file_stat size "$path") || return
-    ((size <= 8388608)) || return 4
+    ((size <= MAX_JSON_BYTES)) || return 4
     raw=$(/bin/cat "$path") || return
     value=$(printf '%s' "$raw" | strict_json) || { fail 4 "invalid JSON record: $path"; return; }
     # Command substitution strips final newlines; compare bytes through a file too.
@@ -171,6 +174,15 @@ signal_child() {
         fi
     done < <(jobs -l)
 }
+# Reap only our own job. A child that ignores cancellation must not hold the
+# launcher open until a long maintenance timeout expires.
+finish_child() {
+    signal_child "$1"
+    /bin/sleep "$CHILD_TERM_GRACE_SECONDS"
+    signal_child KILL
+    wait "$CHILD_PID" 2>/dev/null
+    CHILD_PID=
+}
 interrupted() { INTERRUPTED=$1; signal_child "$1"; }
 operation_active() {
     [[ -z "${INTERRUPTED:-}" ]] || return "$((128 + INTERRUPTED))"
@@ -178,7 +190,7 @@ operation_active() {
 capture_within_limits() {
     local out_size err_size
     out_size=$(file_stat size "$CAPTURE_OUT") && err_size=$(file_stat size "$CAPTURE_ERR") || return 3
-    ((out_size <= 8388608 && err_size <= 1048576))
+    ((out_size <= MAX_STDOUT_BYTES && err_size <= MAX_STDERR_BYTES))
 }
 run_capture() {
     local seconds=$1; shift
@@ -191,15 +203,12 @@ run_capture() {
     /usr/bin/env -i "${CHILD_ENV[@]}" "$@" >"$CAPTURE_OUT" 2>"$CAPTURE_ERR" &
     CHILD_PID=$!
     while kill -0 "$CHILD_PID" 2>/dev/null; do
-        if ((SECONDS-start >= seconds)) || ! capture_within_limits; then
-            signal_child TERM; /bin/sleep 0.1; signal_child KILL
-            wait "$CHILD_PID" 2>/dev/null
-            CHILD_PID=
+        if [[ -n "$INTERRUPTED" ]] || ((SECONDS-start >= seconds)) || ! capture_within_limits; then
+            finish_child "${INTERRUPTED:-TERM}"
             operation_active || return
             return 3
         fi
-        [[ -z "$INTERRUPTED" ]] || { signal_child "$INTERRUPTED"; }
-        /bin/sleep 0.05
+        /bin/sleep "$PROCESS_POLL_SECONDS"
     done
     wait "$CHILD_PID"; status=$?; CHILD_PID=
     [[ -z "$INTERRUPTED" ]] || return "$((128 + INTERRUPTED))"
@@ -208,7 +217,7 @@ run_capture() {
     return "$status"
 }
 capture_json() {
-    if ! run_capture 10 "$@"; then
+    if ! run_capture "$INSPECT_TIMEOUT" "$@"; then
         # Keep a user's cancellation distinct from an inspection failure.
         operation_active || return
         fail 3 'external inspection failed'
@@ -218,7 +227,7 @@ capture_json() {
 }
 # These adapters are replaced by tests, not by production environment switches.
 podman_json() { capture_json "$PODMAN" "${PODMAN_OPTIONS[@]}" "$@"; }
-podman_status() { run_capture 10 "$PODMAN" "${PODMAN_OPTIONS[@]}" "$@"; }
+podman_status() { run_capture "$INSPECT_TIMEOUT" "$PODMAN" "${PODMAN_OPTIONS[@]}" "$@"; }
 same_directory() {
     local first second
     first=$(canonical_path "$1") && second=$(canonical_path "$2") || return 0

@@ -1,19 +1,41 @@
 # Bash launcher behaviour
 
-`hermes-container.sh` is the active Bash launcher. Keep `lib/` beside it. The Python
+`hermes-container.sh` is the active Bash launcher. Keep `config/` and `lib/` beside it. The Python
 reference has its own design in a separate local worktree, outside this Bash
 branch. Its code and records are not migrated by this launcher.
+
+## Configuration
+
+All launcher settings and defaults live in `config/hermes-container.conf`. It is a plain
+`NAME=value` data file with full-line comments, not executable shell code. Every
+known key must appear once. Unknown keys, duplicates, empty values, invalid paths,
+invalid ports, invalid release dates, binary input and inconsistent timeouts are
+refused. Errors distinguish unknown names, duplicates and invalid values.
+Conflicting timeouts name the keys that need changing.
+Settings are read into one snapshot at command startup; environment values do not override
+them. `--check-config` validates the file without a terminal or Podman.
+
+Paths, ports, resources, release sources, version requirements, retention,
+timeouts and input limits are configurable. Registry/release origins, release
+page size, terminal fallback and process supervision intervals also live in the
+configuration file. JSON input, captured stdout and captured stderr have separate
+size limits. Values stated below describe the
+shipped defaults. Host paths do not change the image's native `/opt/data` contract.
+Security checks (ownership, permissions, loopback-only publishing, no implicit
+pulls, no automatic recovery) remain mandatory behavior. Stop before changing
+service settings or paths; no automatic migration or recreation is performed.
+The selected-image JSON and Hermes' own config.yaml/.env remain separate files.
 
 ## Commands and host checks
 
 Use `./hermes-container.sh setup <workspace>` for setup, `./hermes-container.sh chat <workspace>` for
-chat, or `./hermes-container.sh` to select a workspace and chat. Use `./hermes-container.sh import
+chat, or `./hermes-container.sh` to select a workspace and chat. Use `./hermes-container.sh restore
 [workspace] [backup.zip]` to restore; omit the path for a numbered backup list.
 `./hermes-container.sh backup [workspace]` creates a verified native backup on demand.
 `./hermes-container.sh start [workspace]` starts or reuses the shared gateway/dashboard container
-using saved Hermes authentication; see the [service instructions](../README.md#one-container-for-gateway-dashboard-and-chat).
+using saved Hermes authentication; see the [service instructions](../README.md#commands).
 `./hermes-container.sh stop [workspace]` stops gateways and removes that container, preserving host data.
-Setup/chat/start/stop/backup/import require a
+Setup/chat/start/stop/backup/restore require a
 terminal; EOF cancels. Help works offline. Green means success, red
 means error and amber means warning. `NO_COLOR=1` and redirected output disable
 colour.
@@ -29,10 +51,17 @@ Help is available only as `--help` or `-h`.
 
 Requirements are Bash 3.2+, jq 1.7+, curl, unzip and Podman. Production needs no
 host Python. macOS Apple Silicon requires macOS 27+ and Podman client/engine
-6.1.1+; macOS Intel requires macOS 15+ and Podman 5.8.4+; Linux Intel/AMD x86-64
+6.1.1+; macOS Intel requires macOS 15+ and Podman 5.8.3+; Linux Intel/AMD x86-64
 requires Podman 6.1.1+. These are project minimums, not claims that every newer
 combination is tested. Actual macOS versions are checked; Linux distribution
 versions are not tracked. Linux ARM is outside scope.
+
+jq, curl and Podman are found using the configured trusted search path, which
+defaults to standard Homebrew and system directories.
+Their resolved executable must be owned by root or the current user and must
+not be group/world writable. A Homebrew executable owned by another account
+can therefore be rejected even when it runs from that account's terminal.
+The error names the tool and explains these requirements.
 
 The engine must be native rootless Linux with cgroups v2, at least 2 CPUs and
 6 GiB RAM. Containers receive 1 CPU, 2 GiB RAM and 512 MiB shared memory. Linux
@@ -53,7 +82,7 @@ Workspaces are immediate directories under `/Volumes/Data`, owned by the current
 account. Their spelling starts with one capital letter, then lowercase letters,
 digits, underscores or hyphens, with at most 32 characters. Lowercasing the name
 must give the current lowercase login username. Input accepts any case:
-`ezirius`, `Ezirius` and `EZIRIUS` all select `Ezirius`. No username is hardcoded.
+`ezirius`, `Ezirius` and `EZIRIUS` all select `Ezirius`. Workspace selection does not hardcode a username.
 The launcher does not create accounts, rename directories or select another
 account's workspace.
 
@@ -68,7 +97,7 @@ For account `ezirius`, the mounts are:
 
 macOS requires the account home `/Users/<lowercase-login>`. Linux uses the actual
 account home from the OS database, normally `/home/<login>`, for the second Docs
-source. `/Volumes/Data` remains the workspace base on both systems.
+source. `/Volumes/Data` is the default workspace base on both systems.
 
 Setup/chat/start mount Home, both Docs directories and Backups read/write. Another
 container mounting the same Home, Agent Docs, User Docs or Backups directory
@@ -78,7 +107,7 @@ during service operations. Maintenance requires it to be stopped and removed.
 Other directories, including parents and children,
 are allowed. Other matching workspace labels still block execution. Different mount
 directories can still expose Hermes files; do not run a second Hermes session
-through them during setup, chat, start, backup or import. All returned
+through them during setup, chat, start, backup or restore. All returned
 Podman IDs are inspected and two matching inventories are required. Apple
 container inventory is also checked when its CLI is installed on Apple Silicon.
 
@@ -87,18 +116,23 @@ operation. Home, Docs, Backups and their parent directories may be symlinks:
 the launcher mounts their resolved host paths and checks that their destinations
 stay unchanged.
 Container Docs paths retain the names shown above. Path resolution allows at most
-64 combined symlink and parent steps, so cyclic links fail instead of hanging.
+the configured number of combined symlink and parent steps (64 by default), so cyclic links fail instead of hanging.
 Broken links, unsafe target permissions and replaced paths are refused.
 Neither resolved Docs directory may
 equal, contain or sit inside Hermes Home: Docs are working files, while Home is private
-and backed up. Private launcher records and locks
+and backed up. Backups must not equal, contain or sit inside Home or either Docs
+directory, including through symlinks. Private launcher records and locks
 still require regular files/directories. New
 directories use 0700; records and archives use 0600. Existing safe Home/Docs
 permissions are preserved. Missing source directories are created after locking.
 
-Fresh setup without image configuration or usable legacy records offers import,
-new setup or cancellation. It requires empty Home apart from `backups` and safe
-regular Finder `.DS_Store` files. Existing Docs may remain. Failed scans never count as empty. Foreign
+Fresh setup without image configuration or usable legacy records offers restore,
+new setup or cancellation. It requires empty Home apart from safe regular Finder
+`.DS_Store` files. Any existing `Home/backups` path, including an empty directory,
+blocks first setup or restore into an unconfigured Home. The error requests manual
+inspection or migration; the launcher preserves the path and its contents.
+Existing archives in the separate `Hermes/Backups/` directory are allowed.
+Existing Docs may remain. Failed scans never count as empty. Foreign
 metadata, old Home/Docs layouts and unexplained existing data require inspection.
 
 ## The three records kept
@@ -124,8 +158,8 @@ show diagnostics. Runtime storage is temporary; this is not a permanent record
 of an interrupted operation.
 
 Existing `.hermesagent` records are left untouched. There is no new compatibility
-cache, persistent transaction journal or optional launcher settings file. Old
-settings no longer disable checks. An old active lock still blocks execution.
+cache, persistent transaction journal. The required launcher settings file is separate
+from old metadata; old settings no longer disable checks. An old active lock still blocks execution.
 When image configuration is absent, explicit setup may offer the image from
 valid old Bash records: the pending target, otherwise the accepted image. This
 requires confirmation and a native backup before running setup. It does not
@@ -148,6 +182,9 @@ The native gateway API is not published. Saved Hermes authentication is retained
 
 The launcher checks container name, image digest, labels, command, mounts,
 auth-preserving dashboard settings and published port before reuse/removal.
+CPU, memory, shared memory and restart policy must also match the launcher configuration.
+CPU limits support the NanoCpus and quota/period forms in the
+[Podman inspect schema](https://github.com/podman-container-tools/podman/blob/main/libpod/define/container_inspect.go).
 Environment settings must have unique keys; malformed exec-session lists are refused.
 Reuse also requires local terminal execution, Agent Docs as the terminal working
 directory, and Agent Docs as the configured write-safe root.
@@ -165,7 +202,7 @@ Stop requires the operation lock and no active exec sessions. It stops and waits
 for the dashboard, calls native `gateway stop --all`, verifies stopped records,
 then stops and removes the container without removing host data or volumes.
 Command failures name the failed step and the preserved private output files;
-later shutdown steps do not run. Setup, backup and import require
+later shutdown steps do not run. Setup, backup and restore require
 this stop first. For `chat`/`start`, the update menu explicitly includes stop,
 backup and restart in its approval. The launcher prepares the images and obtains
 any encryption acknowledgement before stopping. It rechecks the service identity
@@ -210,7 +247,7 @@ check may use the configured cached image; first setup cannot use that
 fallback. Offline fallback never pulls. Malformed responses, unexpected content
 types and oversized responses are errors, not offline fallback conditions.
 Invalid or inconsistent release metadata prints an error before stopping.
-An unavailable first check reports that setup/import needs an online image selection.
+An unavailable first check reports that setup/restore needs an online image selection.
 
 Images come from `docker.io/nousresearch/hermes-agent` and run by digest with
 `--pull=never`. Maintenance containers use `--rm`; the service instead uses
@@ -228,7 +265,10 @@ gateway records are checked: maintenance refuses running intent; service startup
 allows it. Unknown, malformed or symlinked records are refused. The dashboard is
 enabled only in the persistent service. Brave is deferred.
 
-Signals reach the owned child. Cancellation is checked before new captured commands,
+Signals reach the owned local child. On cancellation or timeout, the launcher waits
+`CHILD_TERM_GRACE_SECONDS`, then kills and reaps that child if it has not exited.
+This bounds the local client shutdown; it does not prove that a container stopped.
+Cancellation is checked before new captured commands,
 interactive startup, backup publication and retention deletion.
 Chat checks cancellation again after its final inventory check, before opening exec.
 Post-run inventory and recorded container IDs detect unexpected surviving containers;
@@ -258,7 +298,7 @@ ignored. Unsafe paths, duplicate, encrypted or special members and file/director
 collisions are refused. These checks cannot prove that every intended source file
 was captured or that a future Hermes release will restore it correctly.
 Archive listings may replace control characters with printable text. Actual Home
-filenames are therefore checked before backup and after staged import; the ZIP
+filenames are therefore checked before backup and after staged restore; the ZIP
 listing alone is not proof that the original filenames are safe.
 
 A verified archive and receipt are published immediately under
@@ -282,7 +322,7 @@ There is no daily scheduler.
 Recovery is manual. Inspect the selected image, Home, backup receipts and any
 residual container before retrying. A failed setup does not create a persistent
 marker blocking chat; the operator decides when Home is safe to use again.
-Changing an image selection does not restore data. `import` is a separate,
+Changing an image selection does not restore data. `restore` is a separate,
 explicit command. Without a path it lists recognised native ZIP filenames in
 Backups and old operation directories, newest filename first. Hidden pending
 captures are excluded. A list entry is not a claim that its ZIP is verified.
@@ -292,15 +332,19 @@ No backups produces a clear error.
 Explicit ZIP paths may be relative or absolute. Archives must be owned by the
 operator, regular files and not group/world writable.
 
-Import copies the archive into private `Backups/.import-<operation>/`,
-checks the ZIP and any adjacent receipt, and confirms use without a receipt when
+Restore checks free space for the compressed archive plus the configured reserve
+before copying into private `Backups/.import-<operation>/`. The copy is a supervised
+command with cancellation and the configured maintenance timeout. It then checks the ZIP and any adjacent receipt, and confirms use without a receipt when
 one is absent. A receipt from a newer Hermes version than the selected image is
-refused; the version check does not guarantee compatibility. External-provider `_external/` members require manual import:
+refused; the version check does not guarantee compatibility. External-provider `_external/` members require manual restore:
 their native destination is outside the persistent Home mount. Capacity requires
 twice the uncompressed ZIP size plus 1 GiB free after copying. After staging and
 the safety backup, free space on the Home volume is checked for one live copy plus
 1 GiB. The initial staging check uses the Backups volume.
-These are estimates, not reserved space.
+These are estimates, not reserved space. Backup, restore and host storage checks
+reject malformed byte counts and values outside the exact integer range. Capacity
+checks use division rather than multiplying archive-supplied sizes, avoiding
+integer overflow.
 
 The selected/recorded image runs native `hermes import /import.zip --force` first
 against a temporary Home, with read-only ZIP input, no network and no Docs mounts.
@@ -308,24 +352,24 @@ The launcher requires clean output, a non-empty restore, matching root config an
 .env bytes when archived, safe gateway state and actual restored filenames without
 control characters or special files. Ordinary Unicode names and spaces are allowed.
 These checks do not establish full database integrity or provider functionality.
-If no config existed before import, the exact observed startup warning about a
+If no config existed before restore, the exact observed startup warning about a
 pre-version-12 seeded config is allowed only when the restored config matches the
-archive byte for byte. Other warnings still stop import; backup checks grant no
+archive byte for byte. Other warnings still stop restore; backup checks grant no
 such exception. Startup logs remain available in staging on failure.
 After explicit confirmation,
-existing Home data receives a verified native backup before the live import.
-The live import mounts the separate Backups directory at `/opt/data/backups`;
-the staged import keeps that path inside its temporary Home.
-The live import uses the same image and ZIP. Native import overwrites matching
+existing Home data receives a verified native backup before the live restore.
+The live restore mounts the separate Backups directory at `/opt/data/backups`;
+the staged restore keeps that path inside its temporary Home.
+The live restore uses the same image and ZIP. Native restore overwrites matching
 files; files absent from the ZIP remain. This is not a directory replacement.
 
 An existing image configuration is retained. An empty, unconfigured Home selects
-an image and saves that config before live import; import does not combine a
-configured workspace's recovery with an update. First import allows existing
+an image and saves that config before live restore; restore does not combine a
+configured workspace's recovery with an update. First restore allows existing
 backups but refuses unexplained unmanaged Home data. A failed or interrupted
-import keeps staging/logs and any pre-import backup; recovery remains manual.
+restore keeps staging/logs and any pre-restore backup; recovery remains manual.
 Success removes only the private staging copy, leaves the selected source ZIP,
-and does not prune backups. First setup's import option uses this same flow.
+and does not prune backups. First setup's restore option uses this same flow.
 Configured or legacy-image setup retains its normal configuration flow.
 
 Backups do not include either Docs directory or launcher configuration. Their
@@ -345,6 +389,6 @@ temporary files with simulated external services. Complete interactive setup,
 chat and recovery with this minimum-state design remain unverified on the target
 platforms. Earlier image probes do not establish acceptance of this new lifecycle.
 
-Native backup naming and import behaviour were checked against the
+Native backup naming and restore behaviour were checked against the
 [official v2026.9.11 source](https://github.com/NousResearch/hermes-agent/blob/v2026.9.11/hermes_cli/backup.py).
 That historical check does not prove another selected image's behaviour.

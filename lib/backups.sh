@@ -1,14 +1,14 @@
-# Hermes creates archives. The host verifies them and keeps the last 14 days.
+# Hermes creates archives. The host verifies them and applies the configured retention period.
 validate_zip() {
     local archive=$1 name member previous= found=false
     safe_path "$archive" file 600 || return
     [[ -s "$archive" ]] || return 4
-    run_capture 120 /usr/bin/unzip -t -P '' "$archive" || return 4
-    run_capture 30 /usr/bin/unzip -Z -v "$archive" || return 4
+    run_capture "$ZIP_TEST_TIMEOUT" /usr/bin/unzip -t -P '' "$archive" || return 4
+    run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -Z -v "$archive" || return 4
     /usr/bin/grep -Eq 'file security status:[[:space:]]+encrypted' "$CAPTURE_OUT" && return 4
-    run_capture 30 /usr/bin/unzip -Z -l "$archive" || return 4
+    run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -Z -l "$archive" || return 4
     /usr/bin/grep -Eq '^[lbcps][rwxstST-]{9}[[:space:]]' "$CAPTURE_OUT" && return 4
-    run_capture 30 /usr/bin/unzip -Z -1 "$archive" || return 4
+    run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -Z -1 "$archive" || return 4
     /usr/bin/sort "$CAPTURE_OUT" > "$SCRATCH/members" || return
     while IFS= read -r name; do
         [[ -n "$name" && "$name" != /* && "$name" != *\\* && "$name" != "$previous" ]] || return 4
@@ -67,7 +67,7 @@ check_home_entries() {
     done < "$SCRATCH/source-names"
 }
 check_backup_sources() {
-    local allocated logical available stat_args du_args
+    local allocated logical stat_args du_args
     check_home_entries "$HERMES_DATA" || return
     # Native Hermes excludes backups; do not count old archives as new input.
     # Run du inside Home so its exclusion pattern contains no host-path wildcards.
@@ -80,14 +80,15 @@ check_backup_sources() {
         -name backups -exec /bin/test '{}' = "$HERMES_DATA/backups" \; -prune \
         -o -type f -exec /usr/bin/stat "${stat_args[@]}" {} + |
         /usr/bin/awk '{total+=$1} END {printf "%.0f\n",total}') || return
+    valid_byte_count "$allocated" && valid_byte_count "$logical" || {
+        fail 3 'cannot establish a safe backup source size'; return
+    }
     ((allocated>logical)) && logical=$allocated
-    available=$(free_bytes "$BACKUPS") || return
-    [[ "$available" =~ ^[0-9]+$ && "$logical" =~ ^[0-9]+$ ]] || return 3
-    ((available >= 2*logical + 1073741824)) || { fail 3 'backup needs source/snapshot space plus 1 GiB reserve'; return; }
+    require_disk_space "$BACKUPS" "$logical" 2 "$BACKUP_RESERVE_GIB"
 }
 native_backup() {
     build_runtime "$1" backup "$HERMES_DATA" "$2" || return
-    run_capture 1800 "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}"
+    run_capture "$MAINTENANCE_TIMEOUT" "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}"
 }
 # Publish each verified backup immediately. Failed setup does not hide its backup
 # behind a transaction journal, and failed captures stay separate for inspection.
@@ -148,7 +149,7 @@ backup_cutoff() {
     local now
     now=$(/bin/date -u +%s) || return
     [[ "$now" =~ ^[0-9]+$ ]] || return 3
-    printf '%s\n' "$((now - 14*86400))"
+    printf '%s\n' "$((now - BACKUP_RETENTION_DAYS*86400))"
 }
 retain_backups() {
     local entry directory receipt_file receipt name hash before cutoff candidate candidates='[]' encoded unverified=false
@@ -198,7 +199,7 @@ retain_backups() {
             /bin/rmdir "$directory" || { warning "Extra files preserved in $directory"; return 4; }
         fi
     # Use verified capture times, not filenames or mutable filesystem timestamps.
-    # Keep the exact boundary and future timestamps; neither is older than 14 days.
+    # Keep the exact boundary and future timestamps; neither has expired.
     done < <(printf '%s' "$candidates" | json -r --argjson cutoff "$cutoff" '.[] | select((.receipt.captured | fromdateiso8601) < $cutoff) | @base64')
     if $unverified; then warning 'Unverified backup files were preserved; retention covers only verified backups.'; fi
 }

@@ -28,14 +28,21 @@ select_import_backup() {
     IMPORT_ARCHIVE=$(printf '%s' "$rows" | json -r --argjson index "$((answer-1))" '.[$index].path')
 }
 prepare_import_archive() {
-    local path receipt_file= receipt hash source_key selected_key
-    safe_path "$IMPORT_ARCHIVE" file || return
-    # Copy once: subsequent commands use this private, verified snapshot.
-    /bin/cp "$IMPORT_ARCHIVE" "$IMPORT_STAGE/input.zip" && /bin/chmod 600 "$IMPORT_STAGE/input.zip" || return
+    local path receipt_file= receipt hash source_key selected_key size
+    operation_active && safe_path "$IMPORT_ARCHIVE" file || return
+    size=$(file_stat size "$IMPORT_ARCHIVE") || return
+    require_disk_space "$BACKUPS" "$size" 1 "$RESTORE_RESERVE_GIB" || return
+    # Copy once, with cancellation and a timeout. Check room before writing it.
+    if ! run_capture "$MAINTENANCE_TIMEOUT" /bin/cp "$IMPORT_ARCHIVE" "$IMPORT_STAGE/input.zip"; then
+        operation_active || return
+        /bin/cp "$CAPTURE_ERR" "$IMPORT_STAGE/copy.stderr" || return
+        fail 3 "could not copy restore archive; inspect $IMPORT_STAGE/copy.stderr (a timeout may leave it empty)"; return
+    fi
+    operation_active && /bin/chmod 600 "$IMPORT_STAGE/input.zip" || return
     validate_zip "$IMPORT_STAGE/input.zip" || { fail 4 'invalid or unsafe Hermes backup ZIP'; return; }
     # External provider files would land in the disposable container's user home.
     if /usr/bin/grep -Eq '^_external(/|$)' "$SCRATCH/members"; then
-        fail 4 'this backup contains external provider files; it needs a manual import'; return
+        fail 4 'this backup contains external provider files; it needs a manual restore'; return
     fi
     path=${IMPORT_ARCHIVE%/*}
     if exists "${IMPORT_ARCHIVE%.zip}-receipt.json"; then receipt_file=${IMPORT_ARCHIVE%.zip}-receipt.json
@@ -50,7 +57,7 @@ prepare_import_archive() {
         source_key=$(release_key "$(printf '%s' "$receipt" | json -r .source.tag)") || return 4
         selected_key=$(release_key "$(printf '%s' "$SELECTED" | json -r .tag)") || return 4
         ((source_key<=selected_key)) || {
-            fail 4 'backup was created by a newer Hermes version; select a suitable image before importing'; return
+            fail 4 'backup was created by a newer Hermes version; select a suitable image before restoring'; return
         }
     else
         warning 'No launcher receipt: ZIP checks cannot establish the backup source or original checksum.'
@@ -60,14 +67,12 @@ prepare_import_archive() {
     IMPORT_HASH=$(file_hash "$IMPORT_STAGE/input.zip")
 }
 check_import_capacity() {
-    local copies=$1 size available destination=$BACKUPS
-    run_capture 30 /usr/bin/unzip -Z -t "$IMPORT_STAGE/input.zip" || return
+    local copies=$1 size destination=$BACKUPS
+    run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -Z -t "$IMPORT_STAGE/input.zip" || return
     size=$(/usr/bin/awk 'NR==1 {print $3}' "$CAPTURE_OUT")
     # Staging lives in Backups; the final restore may be on a different volume.
     [[ "$copies" != 1 ]] || destination=$HERMES_DATA
-    available=$(free_bytes "$destination") || return
-    [[ "$size" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || return 3
-    ((available>=copies*size+1073741824)) || { fail 3 'insufficient free space for import data plus 1 GiB'; return; }
+    require_disk_space "$destination" "$size" "$copies" "$RESTORE_RESERVE_GIB"
 }
 verify_import_stage() {
     verify_lock || return
@@ -87,7 +92,7 @@ import_output_clean() {
       {print}' "$stderr" > "$SCRATCH/import-stderr" || return
     native_output_clean "$stdout" "$SCRATCH/import-stderr" || return
     safe_path "$data/config.yaml" file || return
-    run_capture 30 /usr/bin/unzip -p "$IMPORT_STAGE/input.zip" config.yaml || return
+    run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -p "$IMPORT_STAGE/input.zip" config.yaml || return
     /usr/bin/cmp -s "$CAPTURE_OUT" "$data/config.yaml"
 }
 native_import() {
@@ -96,32 +101,32 @@ native_import() {
     exists "$data/config.yaml" || new_config=true
     build_runtime "$SELECTED" import "$data" "$IMPORT_STAGE/input.zip" || return
     RESIDUAL_UNKNOWN=true
-    run_capture 1800 "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}"; status=$?
+    run_capture "$MAINTENANCE_TIMEOUT" "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}"; status=$?
     operation_active || return
     /bin/cp "$CAPTURE_OUT" "$IMPORT_STAGE/$label.stdout" && /bin/cp "$CAPTURE_ERR" "$IMPORT_STAGE/$label.stderr" || return
     printf '%s\n' "$status" > "$IMPORT_STAGE/$label.exit" || return
     inventory_guard || return
     RESIDUAL_UNKNOWN=false
     if ((status!=0)); then
-        fail 4 "$label import command failed (status $status); inspect $IMPORT_STAGE/$label.stderr"; return
+        fail 4 "$label restore command failed (status $status); inspect $IMPORT_STAGE/$label.stderr"; return
     fi
     if ! import_output_clean "$data" "$new_config" "$IMPORT_STAGE/$label.stdout" "$IMPORT_STAGE/$label.stderr" ||
         [[ "$(/usr/bin/grep -Ec '^Import complete: [1-9][0-9]* files restored' "$IMPORT_STAGE/$label.stdout")" != 1 ]]; then
-        fail 4 "$label import reported warnings or incomplete results; inspect $IMPORT_STAGE/$label.stdout and $IMPORT_STAGE/$label.stderr"; return
+        fail 4 "$label restore reported warnings or incomplete results; inspect $IMPORT_STAGE/$label.stdout and $IMPORT_STAGE/$label.stderr"; return
     fi
 }
 check_imported_home() {
     # Reuse gateway checks against the isolated result without changing live paths.
     local HERMES_DATA=$1 path members found=false
     check_home_entries "$HERMES_DATA" && gateway_guard || return
-    run_capture 30 /usr/bin/unzip -Z -1 "$IMPORT_STAGE/input.zip" || return
+    run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -Z -1 "$IMPORT_STAGE/input.zip" || return
     members=$CAPTURE_OUT
     # Check restored config bytes, not just defaults seeded by the entrypoint.
     for path in config.yaml .env; do
         if /usr/bin/grep -Fxq "$path" "$members"; then
-            run_capture 30 /usr/bin/unzip -p "$IMPORT_STAGE/input.zip" "$path" || return
+            run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -p "$IMPORT_STAGE/input.zip" "$path" || return
             /usr/bin/cmp -s "$CAPTURE_OUT" "$HERMES_DATA/$path" || {
-                fail 4 "imported $path differs from the selected backup"; return
+                fail 4 "restored $path differs from the selected backup"; return
             }
         fi
     done
@@ -131,7 +136,7 @@ check_imported_home() {
             [[ ! -s "$HERMES_DATA/$path" ]] || found=true
         fi
     done
-    $found || { fail 4 'import produced no non-empty Hermes configuration or database'; return; }
+    $found || { fail 4 'restore produced no non-empty Hermes configuration or database'; return; }
 }
 operate_import() {
     local current digest entry
@@ -143,7 +148,7 @@ operate_import() {
     [[ "$SELECTED" != null ]] || SELECTED=$MIGRATION_IMAGE
     if [[ "$SELECTED" == null ]]; then choose_image null || return
     else
-        confirm "Import using configured/recorded Hermes $(printf '%s' "$SELECTED" | json -r .tag)?" || return
+        confirm "Restore using configured/recorded Hermes $(printf '%s' "$SELECTED" | json -r .tag)?" || return
         ALLOW_PULL=true
     fi
     digest=$(printf '%s' "$SELECTED" | json -r .digest)
@@ -153,7 +158,7 @@ operate_import() {
     /bin/mkdir -m 700 "$IMPORT_STAGE" "$IMPORT_STAGE/home" || return
     IMPORT_STAGE_ID=$(identity "$IMPORT_STAGE") || return
     IMPORT_HOME_ID=$(identity "$IMPORT_STAGE/home") || return
-    warning "Import staging is preserved on failure or cancellation: $IMPORT_STAGE"
+    warning "Restore staging is preserved on failure or cancellation: $IMPORT_STAGE"
     prepare_import_archive && native_import "$IMPORT_STAGE/home" staged && check_imported_home "$IMPORT_STAGE/home" || return
     revalidate && verify_import_stage || return
     confirm 'Apply this backup to Hermes Home? Matching files will be overwritten; other files remain.' || return
@@ -166,11 +171,11 @@ operate_import() {
     [[ "$current" != null ]] || save_image "$SELECTED" || return
     native_import "$HERMES_DATA" live && check_imported_home "$HERMES_DATA" || {
         operation_active || return
-        error "Live import did not complete cleanly. Keep backups and $IMPORT_STAGE for manual recovery."
+        error "Live restore did not complete cleanly. Keep backups and $IMPORT_STAGE for manual recovery."
         return 4
     }
     verify_import_stage && operation_active || return
     # This is our private temporary copy, never the selected source archive.
     /bin/rm -rf -- "$IMPORT_STAGE" || return
-    success 'Hermes backup imported. Start chat when ready.'
+    success 'Hermes backup restored. Start chat when ready.'
 }

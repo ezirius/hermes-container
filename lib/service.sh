@@ -7,10 +7,10 @@ check_service_image() {
     [[ "$HOST_OS" == Darwin ]] || return 0
     local tag selected minimum
     tag=$(printf '%s' "$1" | json -r .tag) || return
-    selected=$(release_key "$tag") && minimum=$(release_key v2026.9.14) || return
+    selected=$(release_key "$tag") && minimum=$(release_key "$MIN_SERVICE_RELEASE") || return
     # Older images can enable WAL on a fresh Mac/VM share before our next check.
     ((selected>=minimum)) || {
-        fail 3 'shared service on macOS requires Hermes v2026.9.14 or newer; accept an update first'
+        fail 3 "shared service on macOS requires Hermes $MIN_SERVICE_RELEASE or newer; accept an update first"
         return
     }
 }
@@ -67,7 +67,10 @@ find_service() {
         --arg suffix "-${slug:-workspace}-service-${WORKSPACE_HASH:0:12}" --arg cid "$SERVICE_ID" \
         --arg image "$IMAGE@$digest" --arg hash "$WORKSPACE_HASH" --arg digest "$digest" \
         --arg uid "$OPERATOR_UID" --arg gid "$OPERATOR_GID" --arg port "$(dashboard_port)" \
-        --arg docs_target "$CONTAINER_DOCS" \
+        --arg docs_target "$CONTAINER_DOCS" --arg container_port "$DASHBOARD_CONTAINER_PORT" \
+        --arg restart "$RESTART_POLICY" --argjson cpus "$CONTAINER_CPUS" \
+        --argjson memory "$(config_bytes "$CONTAINER_MEMORY")" \
+        --argjson shm "$(config_bytes "$CONTAINER_SHM_SIZE")" \
         --argjson mounts "$expected" -f "$CODE_DIR/lib/service.jq" >/dev/null || {
         fail 4 "service container $SERVICE_ID differs from the expected name, image, mounts or settings; inspect it manually"
         return
@@ -94,10 +97,10 @@ dashboard_authenticated() {
 }
 wait_dashboard() {
     local attempt expected_id=$SERVICE_ID
-    for ((attempt=0; attempt<20; attempt++)); do
+    for ((attempt=0; attempt<DASHBOARD_ATTEMPTS; attempt++)); do
         operation_active || return
-        if run_capture 3 "$CURL" --disable --silent --show-error --fail --noproxy '*' \
-            --connect-timeout 1 --max-time 2 "http://127.0.0.1:$(dashboard_port)/api/status"; then
+        if run_capture "$DASHBOARD_CAPTURE_TIMEOUT" "$CURL" --disable --silent --show-error --fail --noproxy '*' \
+            --connect-timeout "$DASHBOARD_CONNECT_TIMEOUT" --max-time "$DASHBOARD_HTTP_TIMEOUT" "http://127.0.0.1:$(dashboard_port)/api/status"; then
             if dashboard_authenticated "$CAPTURE_OUT"; then
                 # An HTTP response alone does not prove our container survived.
                 refresh_service || return
@@ -107,7 +110,7 @@ wait_dashboard() {
                 return 0
             fi
         fi
-        /bin/sleep 1
+        /bin/sleep "$DASHBOARD_POLL_SECONDS"
     done
     fail 3 "dashboard is not ready with authentication; inspect: podman logs $(service_name)"
 }
@@ -119,11 +122,11 @@ start_service() {
             fail 4 "service state needs inspection: $SERVICE_STATE"; return
         }
         RESIDUAL_UNKNOWN=true
-        service_command 'start the existing container' 60 start "$SERVICE_ID" || return
+        service_command 'start the existing container' "$SERVICE_RESTART_TIMEOUT" start "$SERVICE_ID" || return
     else
         build_runtime "$IMAGE_CONFIG" service "$HERMES_DATA" || return
         RESIDUAL_UNKNOWN=true
-        run_capture 90 "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}" || {
+        run_capture "$SERVICE_START_TIMEOUT" "$PODMAN" "${PODMAN_OPTIONS[@]}" "${RUNTIME[@]}" || {
             fail 3 "could not start Hermes; inspect: podman ps --all and podman logs $(service_name)"; return
         }
     fi
@@ -152,17 +155,17 @@ stop_service() {
     RESIDUAL_UNKNOWN=true
     if [[ "$SERVICE_STATE" == running ]]; then
         # Stop the dashboard first so it cannot start a gateway during shutdown.
-        service_command 'stop the dashboard' 15 exec "$SERVICE_ID" \
+        service_command 'stop the dashboard' "$SERVICE_CONTROL_TIMEOUT" exec "$SERVICE_ID" \
             /command/s6-svc -d /run/service/dashboard || return
-        service_command 'wait for the dashboard to stop' 15 exec "$SERVICE_ID" \
-            /command/s6-svwait -d -t 10000 /run/service/dashboard || return
-        service_command 'stop the gateways' 60 exec "$SERVICE_ID" \
+        service_command 'wait for the dashboard to stop' "$SERVICE_CONTROL_TIMEOUT" exec "$SERVICE_ID" \
+            /command/s6-svwait -d -t "$DASHBOARD_STOP_TIMEOUT_MS" /run/service/dashboard || return
+        service_command 'stop the gateways' "$GATEWAY_STOP_TIMEOUT" exec "$SERVICE_ID" \
             hermes gateway stop --all || return
     fi
     # Native stop records stopped intent for every profile. Do not rewrite it.
     gateway_guard || return
-    service_command 'stop the container' 45 stop --time 30 "$SERVICE_ID" || return
-    service_command 'remove the stopped container' 15 rm "$SERVICE_ID" || return
+    service_command 'stop the container' "$CONTAINER_STOP_TIMEOUT" stop --time "$CONTAINER_STOP_GRACE" "$SERVICE_ID" || return
+    service_command 'remove the stopped container' "$SERVICE_CONTROL_TIMEOUT" rm "$SERVICE_ID" || return
     SERVICE_ID=; SERVICE_NAME=; ALLOWED_SERVICE_ID=; RUN_CID=
     inventory_guard || return
     RESIDUAL_UNKNOWN=false
@@ -174,14 +177,13 @@ service_chat() {
     # A signal may arrive during the final checks. Do not open a new chat then.
     operation_active || return
     # exec joins the existing container; closing this session never stops it.
-    /usr/bin/env -i "${CHILD_ENV[@]}" TERM="${TERM:-xterm}" "$PODMAN" "${PODMAN_OPTIONS[@]}" \
+    /usr/bin/env -i "${CHILD_ENV[@]}" TERM="${TERM:-$DEFAULT_TERM}" "$PODMAN" "${PODMAN_OPTIONS[@]}" \
         exec -it --user "$OPERATOR_UID:$OPERATOR_GID" --env HOME=/opt/data \
         --workdir "$CONTAINER_DOCS" "$SERVICE_ID" hermes <&0 &
     CHILD_PID=$!
     wait "$CHILD_PID"; status=$?
     if [[ -n "$INTERRUPTED" ]]; then
-        signal_child "$INTERRUPTED"
-        while kill -0 "$CHILD_PID" 2>/dev/null; do wait "$CHILD_PID" 2>/dev/null; done
+        finish_child "$INTERRUPTED"
         RESIDUAL_UNKNOWN=true
         status=$((128+INTERRUPTED))
     fi

@@ -14,8 +14,14 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_JQ = os.environ.get("HERMES_TEST_JQ") or shutil.which("jq") or "/usr/bin/jq"
+# Direct parser tests use the same limits as the launcher configuration.
+TEST_SETTINGS = dict(line.split('=', 1) for line in (ROOT/'config/hermes-container.conf').read_text().splitlines()
+                     if line and not line.startswith('#'))
+JSON_PARSER = [TEST_JQ, '-RscS', '--argjson', 'max_bytes', TEST_SETTINGS['MAX_JSON_BYTES'],
+               '--argjson', 'max_depth', TEST_SETTINGS['MAX_JSON_DEPTH'], '-f', str(ROOT/'lib/json.jq')]
 BOOT = r'''
 source "$1/hermes-container.sh"
+load_launcher_config "$CODE_DIR/config/hermes-container.conf" || exit
 umask 077
 JQ=__TEST_JQ__
 SCRATCH=$2/scratch
@@ -57,6 +63,36 @@ class LauncherTests(unittest.TestCase):
                                     timeout=30)
             self.assertEqual(result.returncode, expect, result.stdout+'\n'+result.stderr)
             return result
+
+    def test_missing_or_wrong_type_path_reports_the_path(self):
+        for target in ('$ACCOUNT_HOME/missing', '$ACCOUNT_HOME'):
+            result = self.shell(f'safe_path "{target}" file', expect=4)
+            self.assertIn('required file is missing, inaccessible or the wrong type:', result.stderr)
+            self.assertIn('/hermes-bash-test-', result.stderr)
+
+    def test_tool_discovery_reports_missing_or_rejected_tool(self):
+        result = self.shell('find_tool hermes-test-nonexistent-tool', expect=3)
+        self.assertIn('hermes-test-nonexistent-tool is unavailable', result.stderr)
+        # Simulate foreign ownership without changing any installed executable.
+        result = self.shell(r'''
+file_stat() {
+    case "$1" in owner) printf '999999\n' ;; mode) printf '755\n' ;; esac
+}
+find_tool sh
+''', expect=3)
+        self.assertIn('sh is unavailable', result.stderr)
+        self.assertIn('owned by root or this user', result.stderr)
+
+    def test_tool_discovery_accepts_root_or_current_user(self):
+        self.shell(r'''
+for tool_owner in 0 "$OPERATOR_UID"; do
+    file_stat() {
+        case "$1" in owner) printf '%s\n' "$tool_owner" ;; mode) printf '755\n' ;; esac
+    }
+    found=$(find_tool sh) || exit
+    [[ -x "$found" ]] || exit 1
+done
+''')
 
     def test_file_hash_ignores_filename_escaping(self):
         def setup(root):
@@ -203,7 +239,7 @@ if load_workspace; then exit 1; fi
             (root/'b').symlink_to('a')
             process = subprocess.Popen(
                 ['/bin/bash', '-c',
-                 'source "$1/hermes-container.sh"; canonical_path "$2"',
+                 'source "$1/hermes-container.sh"; load_launcher_config "$CODE_DIR/config/hermes-container.conf" || exit; canonical_path "$2"',
                  'check', str(ROOT), str(root/'a')],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             try:
@@ -266,15 +302,47 @@ main setup workspace
 [[ $? == 130 ]]
 ''')
 
-    def test_capture_timeout_after_signal_keeps_signal_status(self):
+    def test_capture_cancellation_reaps_child_without_waiting_for_timeout(self):
         self.shell(r'''
 trap 'interrupted 15' TERM
 (sleep 0.2; kill -TERM $$) &
-run_capture 1 /bin/bash -c 'trap "" TERM; exec /bin/sleep 20'
+started=$SECONDS
+run_capture 20 /bin/bash -c 'trap "" TERM; echo $$ > "$1"; exec /bin/sleep 20' sh "$SCRATCH/child.pid"
 status=$?
-[[ $status == 143 && -z "$CHILD_PID" ]]
+[[ $status == 143 && -z "$CHILD_PID" ]] || exit 1
+((SECONDS-started<10)) || exit 1
+! kill -0 "$(cat "$SCRATCH/child.pid")" 2>/dev/null
 ''')
 
+
+    def test_interactive_cancellation_reaps_stubborn_local_child(self):
+        for command in ('run_session unused setup', 'service_chat'):
+            with self.subTest(command=command):
+                self.shell(r'''
+verify_lock() { return 0; }
+gateway_guard() { return 0; }
+inventory_guard() { return 0; }
+build_runtime() { RUNTIME=(); }
+PODMAN=$SCRATCH/podman
+cat > "$PODMAN" <<'CHILD'
+#!/bin/bash
+trap '' TERM
+printf '%s\n' "$$" > "$HOME/child.pid"
+exec /bin/sleep 20
+CHILD
+chmod 700 "$PODMAN"
+trap 'interrupted 15' TERM
+# Wait for the fake client to install its handler before cancelling it.
+(while [[ ! -f "$ACCOUNT_HOME/child.pid" ]]; do sleep 0.05; done; kill -TERM $$) &
+notifier=$!
+started=$SECONDS
+COMMAND_PLACEHOLDER
+status=$?
+wait "$notifier"
+[[ $status == 143 && -z "$CHILD_PID" ]] || exit 1
+((SECONDS-started<10)) || exit 1
+! kill -0 "$(cat "$ACCOUNT_HOME/child.pid")" 2>/dev/null
+'''.replace('COMMAND_PLACEHOLDER', command))
 
     def test_machine_connection_is_verified_and_fixed(self):
         self.shell(r'''
@@ -360,7 +428,7 @@ if check_jq; then exit 1; fi
                      ['setup', ''], ['chat', '../x'],
                      ['chat', 'x', 'y'], ['chat', '--unknown'], ['backup', '-h'],
                      ['dashboard'], ['dashboard', 'ezirius'], ['start', '--unknown'], ['start', 'ezirius', 'extra'],
-                     ['import', '--unknown'], ['setup', 'two words'],
+                     ['restore', '--unknown'], ['import'], ['setup', 'two words'],
                      ['chat', 'x' * 33]]:
             result = subprocess.run([str(ROOT/'hermes-container.sh'), *args], capture_output=True)
             self.assertEqual(result.returncode, 2)
@@ -371,7 +439,7 @@ if check_jq; then exit 1; fi
 
     def test_json_valid(self):
         value = {'a': {'x': 1}, 'b': [True, None, 'quotes " and \\ and λ']}
-        result = subprocess.run([TEST_JQ, '-RscS', '-f', str(ROOT/'lib/json.jq')],
+        result = subprocess.run(JSON_PARSER,
                                 input=json.dumps(value), text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), value)
@@ -383,7 +451,7 @@ if check_jq; then exit 1; fi
                  '['*66+'0'+']'*66, '{bad}', 'truex']
         for value in cases:
             with self.subTest(value=value):
-                result = subprocess.run([TEST_JQ, '-RscS', '-f', str(ROOT/'lib/json.jq')],
+                result = subprocess.run(JSON_PARSER,
                                         input=value, text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
 
@@ -436,6 +504,43 @@ if load_workspace; then exit 1; fi
 ''')
         self.assertIn('existing entry:', result.stderr)
         self.assertIn('/Home/data"', result.stderr)
+
+    def test_first_setup_and_import_refuse_old_backups_without_deleting_them(self):
+        for action in ('setup', 'restore'):
+            with self.subTest(action=action):
+                result = self.shell(r'''
+ACTION=ACTION_PLACEHOLDER
+mkdir -m 700 "$HERMES_DATA" "$HERMES_DATA/backups"
+printf preserve > "$HERMES_DATA/backups/old.zip"
+load_workspace; [[ $? == 4 ]] || exit 1
+[[ $(cat "$HERMES_DATA/backups/old.zip") == preserve ]] || exit 1
+[[ ! -e "$CONFIG_DIR" && ! -e "$ACTIVE_LOCK" ]]
+'''.replace('ACTION_PLACEHOLDER', action))
+                self.assertIn('inspect or migrate it manually', result.stderr)
+
+    def test_first_setup_refuses_any_old_backups_path(self):
+        for kind in ('empty', 'file', 'symlink', 'broken', 'writable'):
+            with self.subTest(kind=kind):
+                self.shell(r'''
+mkdir -m 700 "$HERMES_DATA"
+case KIND in
+ empty) mkdir -m 700 "$HERMES_DATA/backups" ;;
+ broken) ln -s "$SCRATCH/missing" "$HERMES_DATA/backups" ;;
+ file) printf preserve > "$HERMES_DATA/backups" ;;
+ symlink) mkdir "$SCRATCH/old-backups"; ln -s "$SCRATCH/old-backups" "$HERMES_DATA/backups" ;;
+ writable) mkdir -m 777 "$HERMES_DATA/backups" ;;
+esac
+load_workspace; [[ $? == 4 ]] || exit 1
+[[ ! -e "$CONFIG_DIR" && ! -e "$ACTIVE_LOCK" ]] || exit 1
+# Refusal must preserve the original file, link or directory.
+case KIND in
+ empty) [[ -d "$HERMES_DATA/backups" ]] ;;
+ broken) [[ -L "$HERMES_DATA/backups" ]] ;;
+ file) [[ $(cat "$HERMES_DATA/backups") == preserve ]] ;;
+ symlink) [[ -L "$HERMES_DATA/backups" ]] ;;
+ writable) [[ $(file_stat mode "$HERMES_DATA/backups") == 777 ]] ;;
+esac
+'''.replace('KIND', kind))
 
     def test_unreadable_home_refused_before_first_setup(self):
         self.shell(r'''
@@ -573,7 +678,7 @@ choose_image '%s' || exit
 
     def test_first_image_check_failure_explains_why(self):
         result = self.shell('resolve_online() { return 3; }; choose_image null', expect=3)
-        self.assertIn('first setup/import needs an online image selection', result.stderr)
+        self.assertIn('first setup/restore needs an online image selection', result.stderr)
 
 
     def test_inventory_official_schemas(self):
@@ -936,7 +1041,7 @@ json -n --arg cid "$cid" --arg name "$(service_name)" --arg image "$IMAGE@sha256
  Env:["HERMES_DASHBOARD=1","HERMES_DASHBOARD_HOST=0.0.0.0","HERMES_DASHBOARD_PORT=9119",
  "HERMES_UID="+$uid,"HERMES_GID="+$gid,"TERMINAL_ENV=local",
  "TERMINAL_CWD="+$dt,"HERMES_WRITE_SAFE_ROOT="+$dt]},
- HostConfig:{AutoRemove:false,Privileged:false,RestartPolicy:{Name:"unless-stopped"},
+ HostConfig:{Memory:2147483648,ShmSize:536870912,NanoCpus:1000000000,AutoRemove:false,Privileged:false,RestartPolicy:{Name:"unless-stopped"},
  PortBindings:{"9119/tcp":[{HostIp:"127.0.0.1",HostPort:"59119"}]}},
  Mounts:([{Source:$home,Destination:"/opt/data"},{Source:$backups,Destination:"/opt/data/backups"},
  {Source:$docs,Destination:$dt},{Source:$user,Destination:$ut}] | map(.+{Type:"bind",RW:true}))}]' > "$SCRATCH/original"
@@ -954,6 +1059,12 @@ podman_json() {
 find_service || exit
 [[ "$SERVICE_NAME" == "$(json -r '.[0].Name' < "$SCRATCH/original")" ]] || exit 1
 [[ "$SERVICE_ID" == "$cid" && "$SERVICE_STATE" == running ]] || exit 1
+# Podman can also describe a CPU limit using quota and period.
+json '.[0].HostConfig |= (.NanoCpus=0 | .CpuPeriod=100000 | .CpuQuota=100000)' < "$SCRATCH/original" > "$SCRATCH/inspect"
+find_service || exit
+json '.[0].HostConfig.NanoCpus=2000000000' < "$SCRATCH/inspect" > "$SCRATCH/conflicting"
+mv "$SCRATCH/conflicting" "$SCRATCH/inspect"
+if find_service; then exit 1; fi
 for change in '.[0].Name="hermes-workspace"' '.[0].Name |= sub("-service-";"-chat-")' '.[0].Config.Labels={}' '.[0].Config.Cmd=["sleep","infinity"]' \
  '.[0].Mounts[0].Source="/wrong"' '.[0].HostConfig.Privileged=true' \
  '.[0].HostConfig.PortBindings["9119/tcp"][0].HostIp="0.0.0.0"' \
@@ -963,6 +1074,8 @@ for change in '.[0].Name="hermes-workspace"' '.[0].Name |= sub("-service-";"-cha
  '.[0].Config.Env |= map(if startswith("TERMINAL_ENV=") then "TERMINAL_ENV=docker" else . end)' \
  '.[0].Config.Env |= map(if startswith("TERMINAL_CWD=") then "TERMINAL_CWD=/tmp" else . end)' \
  '.[0].Config.Env |= map(if startswith("HERMES_WRITE_SAFE_ROOT=") then "HERMES_WRITE_SAFE_ROOT=/" else . end)' \
+ '.[0].HostConfig.Memory=0' '.[0].HostConfig.ShmSize=0' '.[0].HostConfig.NanoCpus=0' \
+ '.[0].HostConfig.RestartPolicy.Name="always"' \
  '.[0].ExecIDs=false' '.[0].ExecIDs=[false]'; do
  json "$change" < "$SCRATCH/original" > "$SCRATCH/inspect"
  find_service; [[ $? == 4 ]] || exit 1
@@ -1345,7 +1458,10 @@ if platform_rules Darwin arm64 27.preview; then exit 1; fi
 if platform_rules Darwin arm64 26.9; then exit 1; fi
 if platform_rules Darwin arm64 15.7; then exit 1; fi
 platform_rules Darwin x86_64 15.7 || exit
-[[ $NATIVE == amd64 && $REQUIRED_PODMAN == 5.8.4 ]] || exit 1
+[[ $NATIVE == amd64 && $REQUIRED_PODMAN == 5.8.3 ]] || exit 1
+version_at_least 5.8.3 "$REQUIRED_PODMAN" || exit
+version_at_least 5.8.4 "$REQUIRED_PODMAN" || exit
+if version_at_least 5.8.2 "$REQUIRED_PODMAN"; then exit 1; fi
 platform_rules Linux x86_64 || exit
 [[ $NATIVE == amd64 && $REQUIRED_PODMAN == 6.1.1 ]] || exit 1
 if platform_rules Linux aarch64; then exit 1; fi
@@ -1372,7 +1488,10 @@ podman_json() {
  esac
 }
 run_capture() {
- if [[ "$6" == /usr/bin/test ]]; then $test_vm_workspace_visible; return; fi
+ if [[ "$6" == "test -d "* ]]; then
+  # Execute the exact remote-shell command locally against a real test path.
+  $test_vm_workspace_visible && /bin/sh -c "$6"; return
+ fi
  guest_checked=true
  CAPTURE_OUT=$SCRATCH/df
  printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 99999999 0 99999999 0%% /\n' > "$CAPTURE_OUT"
@@ -1380,6 +1499,12 @@ run_capture() {
 free_bytes() { printf '99999999999\n'; }
 image_cached() { return 0; }
 host_readiness digest || exit
+original_workspace=$WORKSPACE
+WORKSPACE="$ACCOUNT_HOME/Space and ' quote \$(touch SHOULD_NOT_EXIST)"
+mkdir "$WORKSPACE" || exit
+(cd "$SCRATCH" && host_readiness digest) || exit
+[[ ! -e "$SCRATCH/SHOULD_NOT_EXIST" ]] || exit 1
+WORKSPACE=$original_workspace
 test_vm_workspace_visible=false
 if host_readiness digest; then exit 1; fi
 test_vm_workspace_visible=true
@@ -1777,17 +1902,17 @@ if child_environment; then exit 1; fi
 
     def test_import_arguments(self):
         self.shell(r'''
-parse_args import || exit
-[[ $ACTION == import && -z $WORKSPACE_ARGUMENT && -z $IMPORT_ARGUMENT ]] || exit 1
-parse_args import EZIRIUS || exit
+parse_args restore || exit
+[[ $ACTION == restore && -z $WORKSPACE_ARGUMENT && -z $IMPORT_ARGUMENT ]] || exit 1
+parse_args restore EZIRIUS || exit
 [[ $WORKSPACE_ARGUMENT == EZIRIUS && -z $IMPORT_ARGUMENT ]] || exit 1
-parse_args import ezirius '/tmp/a b.zip' || exit
+parse_args restore ezirius '/tmp/a b.zip' || exit
 [[ $WORKSPACE_ARGUMENT == ezirius && $IMPORT_ARGUMENT == '/tmp/a b.zip' ]] || exit 1
-parse_args import './a b.zip' || exit
+parse_args restore './a b.zip' || exit
 [[ -z $WORKSPACE_ARGUMENT && $IMPORT_ARGUMENT == './a b.zip' ]] || exit 1
-if parse_args import x y z; then exit 1; fi
+if parse_args restore x y z; then exit 1; fi
 if parse_args chat x y; then exit 1; fi
-if parse_args import x ''; then exit 1; fi
+if parse_args restore x ''; then exit 1; fi
 ''')
 
     def test_import_picker_orders_newest_and_reads_legacy(self):
@@ -1812,7 +1937,7 @@ select_import_backup < /dev/null; [[ $? == 130 ]]
     def test_import_empty_list_and_unconfigured_home_with_backups(self):
         self.shell(r'''
 load_workspace && acquire_lock && prepare_directories || exit
-ACTION=import; IMPORT_ARGUMENT=
+ACTION=restore; IMPORT_ARGUMENT=
 select_import_backup; [[ $? == 4 ]] || exit 1
 printf preserve > "$BACKUPS/existing.zip"
 load_workspace || exit
@@ -1826,7 +1951,7 @@ load_workspace && acquire_lock && prepare_directories || exit
 image='IMAGE_PLACEHOLDER'
 save_image "$image" && release_lock || exit
 printf 'old config' > "$HERMES_DATA/config.yaml"
-ACTION=import; IMPORT_ARGUMENT=$ACCOUNT_HOME/fixture.zip
+ACTION=restore; IMPORT_ARGUMENT=$ACCOUNT_HOME/fixture.zip
 select_workspace() { return 0; }
 host_readiness() { return 0; }
 verify_vm_shares() { return 0; }
@@ -2209,9 +2334,9 @@ select_workspace < /dev/null; [[ $? == 130 ]]
 ''')
 
     def test_first_setup_menu_import_new_and_cancel(self):
-        self.shell(r'''
+        result = self.shell(r'''
 choose_setup_action <<< 1 || exit
-[[ $ACTION == import ]] || exit 1
+[[ $ACTION == restore ]] || exit 1
 ACTION=setup
 choose_setup_action <<< 2 || exit
 [[ $ACTION == setup ]] || exit 1
@@ -2221,15 +2346,248 @@ choose_setup_action <<< $'3\n9\n2' || exit
 [[ $ACTION == setup ]] || exit 1
 choose_setup_action <<< Q; [[ $? == 130 ]]
 ''')
+        self.assertIn('1) Restore a backup', result.stderr)
+        self.assertNotIn('Import a backup', result.stderr)
 
     def test_first_setup_dispatches_import_with_existing_backups(self):
         self.shell(r'''
 load_workspace && acquire_lock && prepare_directories && release_lock || exit
 printf preserve > "$BACKUPS/existing.zip"
 select_workspace() { return 0; }
-operate_import() { dispatched=true; [[ $ACTION == import ]]; }
+operate_import() { dispatched=true; [[ $ACTION == restore ]]; }
 operate <<< 1 || exit
 [[ $dispatched == true && ! -e "$IMAGE_FILE" && $(cat "$BACKUPS/existing.zip") == preserve ]]
+''')
+
+    def test_launcher_config_rejects_missing_unknown_duplicate_and_invalid_values(self):
+        changes = [
+            ('MAX_JSON_BYTES=8388608\n', ''),
+            ('MIN_JQ=1.7', 'MIN_JQ=1.7\nMIN_JQ=1.8'),
+            ('MIN_JQ=1.7', 'UNRECOGNISED=1.7'),
+            ('BACKUP_RETENTION_DAYS=14', 'BACKUP_RETENTION_DAYS=0'),
+            ('CONTAINER_CPUS=1', 'CONTAINER_CPUS=01'),
+            ('DASHBOARD_CONTAINER_PORT=9119', 'DASHBOARD_CONTAINER_PORT=65536'),
+            ('DASHBOARD_PORTS=ezirius:19119 nala:29119 default:59119', 'DASHBOARD_PORTS=nala:29119'),
+            ('DASHBOARD_PORTS=ezirius:19119 nala:29119 default:59119', 'DASHBOARD_PORTS=default:59119 default:29119'),
+            ('HOME_PATH=Apps Data/Hermes/Home', 'HOME_PATH=../Home'),
+            ('HOME_PATH=Apps Data/Hermes/Home', 'HOME_PATH=/tmp/Home'),
+            ('WORKSPACE_BASE=/Volumes/Data', 'WORKSPACE_BASE=/Volumes/../Data'),
+            ('TRUSTED_PATH=', 'TRUSTED_PATH=:'),
+            ('CONTAINER_MEMORY=2g', 'CONTAINER_MEMORY=$(touch /tmp/never-execute-config)'),
+            ('MIN_SERVICE_RELEASE=v2026.9.14', 'MIN_SERVICE_RELEASE=v2026.2.30'),
+            ('MIN_PODMAN_ARM64=6.1.1', 'MIN_PODMAN_ARM64=6.1.1-preview'),
+            ('CONTAINER_STOP_TIMEOUT=45', 'CONTAINER_STOP_TIMEOUT=30'),
+            ('DASHBOARD_CAPTURE_TIMEOUT=3', 'DASHBOARD_CAPTURE_TIMEOUT=2'),
+        ]
+        config = (ROOT/'config/hermes-container.conf').read_text()
+        for old, new in changes:
+            with self.subTest(setting=old):
+                self.shell('load_launcher_config "$ACCOUNT_HOME/custom.conf"', expect=3,
+                           setup=lambda root, value=config.replace(old, new):
+                           (root/'custom.conf').write_text(value))
+
+    def test_launcher_config_keeps_shell_text_literal(self):
+        config = (ROOT/'config/hermes-container.conf').read_text().replace(
+            'WORKSPACE_BASE=/Volumes/Data', 'WORKSPACE_BASE=/tmp/$(touch SHOULD_NOT_EXIST)')
+        self.shell(r'''
+cd "$SCRATCH" || exit
+load_launcher_config "$ACCOUNT_HOME/custom.conf" || exit
+[[ "$WORKSPACE_BASE" == '/tmp/$(touch SHOULD_NOT_EXIST)' && ! -e SHOULD_NOT_EXIST ]]
+''', setup=lambda root: (root/'custom.conf').write_text(config))
+
+    def test_custom_paths_ports_resources_and_retention_use_configuration(self):
+        config = (ROOT/'config/hermes-container.conf').read_text()
+        for old, new in [
+            ('HOME_PATH=Apps Data/Hermes/Home', 'HOME_PATH=Custom Data/Private/Home'),
+            ('BACKUPS_PATH=Apps Data/Hermes/Backups', 'BACKUPS_PATH=Custom Backups'),
+            ('AGENT_DOCS_PATH=Apps Data/Hermes/Agent Docs', "AGENT_DOCS_PATH=O'Neil Work Files"),
+            ('USER_DOCS_PATH=Documents/{workspace}/Apps Data/Hermes/User Docs', 'USER_DOCS_PATH=Personal/{workspace}/Files'),
+            ('DASHBOARD_PORTS=ezirius:19119 nala:29119 default:59119', 'DASHBOARD_PORTS=workspace:30123 default:50123'),
+            ('DASHBOARD_CONTAINER_PORT=9119', 'DASHBOARD_CONTAINER_PORT=9120'),
+            ('CONTAINER_CPUS=1', 'CONTAINER_CPUS=2'),
+            ('CONTAINER_MEMORY=2g', 'CONTAINER_MEMORY=3g'),
+            ('CONTAINER_SHM_SIZE=512m', 'CONTAINER_SHM_SIZE=256m'),
+            ('RESTART_POLICY=unless-stopped', 'RESTART_POLICY=on-failure'),
+            ('BACKUP_RETENTION_DAYS=14', 'BACKUP_RETENTION_DAYS=21'),
+        ]:
+            config = config.replace(old, new)
+        self.shell(r'''
+load_launcher_config "$ACCOUNT_HOME/custom.conf" || exit
+set_paths "$WORKSPACE" || exit
+load_workspace && acquire_lock && prepare_directories || exit
+[[ "$HERMES_DATA" == "$WORKSPACE/Custom Data/Private/Home" && -d "$HERMES_DATA" ]] || exit 1
+[[ "$USER_DOCUMENTS" == "$ACCOUNT_HOME/Personal/Workspace/Files" && -d "$USER_DOCUMENTS" ]] || exit 1
+[[ $(dashboard_port) == 30123 ]] || exit 1
+[[ $(ACCOUNT_USER=someone dashboard_port) == 50123 ]] || exit 1
+build_runtime 'IMAGE_PLACEHOLDER' service "$HERMES_DATA" || exit
+[[ "${RUNTIME[*]}" == *'--cpus 2 --memory 3g --shm-size 256m'* &&
+   "${RUNTIME[*]}" == *'127.0.0.1:30123:9120'* &&
+   "${RUNTIME[*]}" == *'HERMES_DASHBOARD_PORT=9120'* &&
+   "${RUNTIME[*]}" == *'--restart=on-failure'* ]] || exit 1
+[[ $(config_bytes "$CONTAINER_MEMORY") == 3221225472 ]] || exit 1
+cutoff=$(backup_cutoff); now=$(date -u +%s)
+((now-cutoff>=21*86400 && now-cutoff<=21*86400+2)) || exit 1
+release_lock
+'''.replace('IMAGE_PLACEHOLDER', json.dumps(IMAGE)),
+                   setup=lambda root: (root/'custom.conf').write_text(config))
+
+    def test_configured_json_limits_are_enforced(self):
+        self.shell(r'''
+MAX_JSON_BYTES=10
+printf '{"a":1}' | strict_json >/dev/null || exit
+if printf '{"abcdefghij":1}' | strict_json >/dev/null; then exit 1; fi
+MAX_JSON_BYTES=100; MAX_JSON_DEPTH=2
+printf '[1]' | strict_json >/dev/null || exit
+if printf '[[[1]]]' | strict_json >/dev/null; then exit 1; fi
+''')
+
+    def test_config_check_does_not_require_terminal_or_podman(self):
+        result = subprocess.run([str(ROOT/'hermes-container.sh'), '--check-config'],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Configuration is valid:', result.stderr)
+
+    def test_storage_checks_reject_overflow_and_malformed_byte_counts(self):
+        self.shell(r'''
+free_bytes() { printf '%s\n' "$test_available"; }
+test_available=1073741824
+for size in 18446744073709551616 9223372036854775807 9007199254740992 01 -1 1e9 '1+2' unknown ''; do
+ require_disk_space "$BACKUPS" "$size" 2 1; [[ $? == 3 ]] || exit 1
+done
+for test_available in 18446744073709551616 01 -1 1e9 unknown ''; do
+ require_disk_space "$BACKUPS" 1 1 1; [[ $? == 3 ]] || exit 1
+done
+# Exact boundary: two one-byte copies plus the configured reserve.
+test_available=1073741826
+require_disk_space "$BACKUPS" 1 2 1 || exit
+test_available=1073741825
+require_disk_space "$BACKUPS" 1 2 1; [[ $? == 3 ]] || exit 1
+require_disk_space "$BACKUPS" 1 1 1 || exit
+# Exercise the ZIP-summary path, not only the shared arithmetic helper.
+run_capture() { CAPTURE_OUT=$SCRATCH/size; printf '1 file, 18446744073709551616 bytes uncompressed\n' > "$CAPTURE_OUT"; }
+IMPORT_STAGE=$SCRATCH
+check_import_capacity 2; [[ $? == 3 ]]
+''')
+
+    def test_restore_checks_space_before_copying_archive(self):
+        result = self.shell(self.import_fixture_script()+r'''
+free_bytes() { printf '1\n'; }
+operate_import; [[ $? == 3 ]] || exit 1
+[[ ! -e "$IMPORT_STAGE/input.zip" && $staged_calls == 0 && $live_calls == 0 && $backup_calls == 0 ]] || exit 1
+[[ -f "$IMPORT_ARGUMENT" && $(cat "$HERMES_DATA/config.yaml") == 'old config' ]]
+''', setup=self.zip_fixture)
+        self.assertIn('insufficient free space', result.stderr)
+
+    def test_restore_cancellation_before_archive_copy_preserves_home(self):
+        self.shell(self.import_fixture_script()+r'''
+require_disk_space() { INTERRUPTED=15; return 0; }
+operate_import; [[ $? == 143 ]] || exit 1
+[[ ! -e "$IMPORT_STAGE/input.zip" && $staged_calls == 0 && $live_calls == 0 ]] || exit 1
+[[ -f "$IMPORT_ARGUMENT" && $(cat "$HERMES_DATA/config.yaml") == 'old config' ]]
+''', setup=self.zip_fixture)
+
+    def test_failed_restore_copy_preserves_diagnostics(self):
+        result = self.shell(self.import_fixture_script()+r'''
+run_capture() {
+ [[ "$2" == /bin/cp ]] || return 99
+ CAPTURE_ERR=$SCRATCH/copy-error
+ printf 'simulated copy failure\n' > "$CAPTURE_ERR"
+ return 3
+}
+operate_import; [[ $? == 3 ]] || exit 1
+[[ $(cat "$IMPORT_STAGE/copy.stderr") == 'simulated copy failure' ]] || exit 1
+[[ $staged_calls == 0 && $live_calls == 0 && $(cat "$HERMES_DATA/config.yaml") == 'old config' ]]
+''', setup=self.zip_fixture)
+        self.assertIn('could not copy restore archive; inspect', result.stderr)
+
+    def test_source_parent_walk_rejects_unrelated_or_unnormalized_roots(self):
+        self.shell(r'''
+for root in / "$ACCOUNT_HOME/" "$ACCOUNT_HOME/other"; do
+ add_source_parents "$root" "$ACCOUNT_HOME/Docs"; [[ $? == 4 ]] || exit 1
+done
+SOURCE_PARENTS=()
+add_source_parents "$ACCOUNT_HOME" "$ACCOUNT_HOME/One/Two/Docs" || exit
+[[ "${SOURCE_PARENTS[*]}" == "$ACCOUNT_HOME/One $ACCOUNT_HOME/One/Two" ]]
+''')
+
+    def test_config_rejects_binary_input(self):
+        config = (ROOT/'config/hermes-container.conf').read_bytes()
+        result = self.shell('load_launcher_config "$ACCOUNT_HOME/binary.conf"', expect=3,
+                            setup=lambda root: (root/'binary.conf').write_bytes(config+b'\x00'))
+        self.assertIn('NUL byte found', result.stderr)
+
+    def test_config_errors_name_the_problem(self):
+        config = (ROOT/'config/hermes-container.conf').read_text()
+        cases = [
+            (config+'MISSPELLED=1\n', 'unknown setting'),
+            (config+'MIN_JQ=1.7\n', 'duplicate setting'),
+            (config.replace('MIN_JQ=1.7', 'MIN_JQ=preview'), 'invalid value for MIN_JQ'),
+            (config.replace('CONTAINER_STOP_TIMEOUT=45', 'CONTAINER_STOP_TIMEOUT=30'),
+             'CONTAINER_STOP_TIMEOUT must exceed CONTAINER_STOP_GRACE'),
+        ]
+        for contents, message in cases:
+            with self.subTest(message=message):
+                result = self.shell('load_launcher_config "$ACCOUNT_HOME/custom.conf"', expect=3,
+                                    setup=lambda root, value=contents: (root/'custom.conf').write_text(value))
+                self.assertIn(message, result.stderr)
+
+    def test_endpoint_and_process_settings_are_validated(self):
+        self.shell(r'''
+for value in http://api.example.test https://user:password@api.example.test https://api.example.test/path https://api.example.test:65536 https://-invalid.test https://api..test; do
+ if config_value_valid RELEASE_API_ORIGIN "$value"; then exit 1; fi
+done
+config_value_valid RELEASE_API_ORIGIN https://api.example.test:8443 || exit
+for value in 0 0.000 -1 1e2 0.1s '$(touch no)'; do
+ if config_value_valid PROCESS_POLL_SECONDS "$value"; then exit 1; fi
+done
+config_value_valid PROCESS_POLL_SECONDS 0.025 || exit
+if config_value_valid RELEASE_PAGE_SIZE 101; then exit 1; fi
+config_value_valid RELEASE_PAGE_SIZE 2
+''')
+
+    def test_configured_endpoints_and_release_page_size_are_used(self):
+        config = (ROOT/'config/hermes-container.conf').read_text()
+        for old, new in [
+            ('IMAGE_REGISTRY=docker.io', 'IMAGE_REGISTRY=images.example.test:5443'),
+            ('RELEASE_API_ORIGIN=https://api.github.com', 'RELEASE_API_ORIGIN=https://releases.example.test'),
+            ('REGISTRY_API_ORIGIN=https://registry-1.docker.io', 'REGISTRY_API_ORIGIN=https://registry.example.test'),
+            ('REGISTRY_AUTH_ORIGIN=https://auth.docker.io', 'REGISTRY_AUTH_ORIGIN=https://auth.example.test'),
+            ('REGISTRY_AUTH_SERVICE=registry.docker.io', 'REGISTRY_AUTH_SERVICE=registry.example.test'),
+            ('RELEASE_PAGE_SIZE=100', 'RELEASE_PAGE_SIZE=2'),
+        ]:
+            config = config.replace(old, new)
+        self.shell(r'''
+load_launcher_config "$ACCOUNT_HOME/custom.conf" || exit
+[[ "$IMAGE" == images.example.test:5443/nousresearch/hermes-agent ]] || exit 1
+[[ "$REGISTRY_URL" == https://registry.example.test/v2/nousresearch/hermes-agent/manifests ]] || exit 1
+[[ "$REGISTRY_AUTH_URL" == 'https://auth.example.test/token?service=registry.example.test&scope=repository:nousresearch/hermes-agent:pull' ]] || exit 1
+http_get() {
+ HTTP_TYPE=application/json
+ case "$1" in
+  'https://releases.example.test/repos/NousResearch/hermes-agent/releases?per_page=2')
+   HTTP_BODY='[{"id":1,"tag_name":"v2026.9.1","published_at":"2026-09-01T00:00:00Z","draft":false,"prerelease":false}]'
+   HTTP_LINK='<https://releases.example.test/repos/NousResearch/hermes-agent/releases?per_page=2&page=2>; rel="next"' ;;
+  'https://releases.example.test/repos/NousResearch/hermes-agent/releases?per_page=2&page=2')
+   HTTP_BODY='[{"id":2,"tag_name":"v2026.9.2","published_at":"2026-09-02T00:00:00Z","draft":false,"prerelease":false}]'
+   HTTP_LINK= ;;
+  *) return 99 ;;
+ esac
+}
+latest=$(github_releases) || exit
+[[ $(printf '%s' "$latest" | json -r .tag) == v2026.9.2 ]]
+''', setup=lambda root: (root/'custom.conf').write_text(config))
+
+    def test_json_and_command_output_limits_are_independent(self):
+        self.shell(r'''
+MAX_JSON_BYTES=4
+MAX_STDOUT_BYTES=16
+CAPTURE_OUT=$SCRATCH/output; CAPTURE_ERR=$SCRATCH/errors
+printf '{"a":1}' > "$CAPTURE_OUT"; : > "$CAPTURE_ERR"
+capture_within_limits || exit
+if strict_json < "$CAPTURE_OUT"; then exit 1; fi
+MAX_JSON_BYTES=16; MAX_STDOUT_BYTES=4
+strict_json < "$CAPTURE_OUT" || exit
+if capture_within_limits; then exit 1; fi
 ''')
 
 if __name__ == '__main__':

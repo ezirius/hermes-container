@@ -1,11 +1,11 @@
 # Host differences stay here so the lifecycle code reads the same on both OSes.
 HOST_OS=$(/usr/bin/uname -s)
 platform_rules() {
-    local os=$1 arch=$2 version=${3:-} minimum_macos=15 major
+    local os=$1 arch=$2 version=${3:-} minimum_macos=$MIN_MACOS_AMD64 major
     case "$os:$arch" in
-        Darwin:arm64) NATIVE=arm64; REQUIRED_PODMAN=6.1.1; minimum_macos=27 ;;
-        Darwin:x86_64) NATIVE=amd64; REQUIRED_PODMAN=5.8.4 ;;
-        Linux:x86_64) NATIVE=amd64; REQUIRED_PODMAN=6.1.1 ;;
+        Darwin:arm64) NATIVE=arm64; REQUIRED_PODMAN=$MIN_PODMAN_ARM64; minimum_macos=$MIN_MACOS_ARM64 ;;
+        Darwin:x86_64) NATIVE=amd64; REQUIRED_PODMAN=$MIN_PODMAN_MACOS_AMD64 ;;
+        Linux:x86_64) NATIVE=amd64; REQUIRED_PODMAN=$MIN_PODMAN_LINUX_AMD64 ;;
         *) fail 3 'supported hosts: macOS Apple Silicon/Intel, Linux Intel/AMD x86-64'; return ;;
     esac
     if [[ "$os" == Darwin ]]; then
