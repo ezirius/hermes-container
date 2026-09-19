@@ -68,6 +68,11 @@ values and timeout relationships. It does not check your installed tools, VM,
 network or data. Settings are read once per command; edits apply to the next run.
 Environment variables do not replace these settings.
 
+`TRUSTED_TOOL_USERS=ezirius` allows tools from the shared Homebrew installation
+owned by `ezirius`. Root and the current user are also trusted. Additional account
+names can be separated by spaces. Tools must be executable and must not be
+group/world writable; this setting does not change workspace or data ownership checks.
+
 **Stop Hermes before changing paths, image sources, ports, resources or restart
 policy.** These changes do not move data or modify an existing container. Reuse
 checks the actual container against the configured settings. If you changed a

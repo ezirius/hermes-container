@@ -52,6 +52,15 @@ parse_args() {
     fi
     (($#<3)) || [[ -n "$3" ]] || return 2
 }
+trusted_tool_owner() {
+    local owner=$1 account trusted
+    [[ "$owner" == 0 || "$owner" == "$OPERATOR_UID" ]] && return 0
+    account=$(/usr/bin/id -un "$owner" 2>/dev/null) || return 1
+    for trusted in $TRUSTED_TOOL_USERS; do
+        [[ "$account" != "$trusted" ]] || return 0
+    done
+    return 1
+}
 find_tool() {
     local name=$1 directory candidate owner mode directories
     IFS=: read -r -a directories <<< "$TRUSTED_PATH"
@@ -59,11 +68,11 @@ find_tool() {
         candidate=$directory/$name
         [[ -x "$candidate" && -f "$candidate" ]] || continue
         candidate=$(canonical_path "$candidate") || return
-        owner=$(file_stat owner "$candidate"); mode=$(file_stat mode "$candidate")
-        [[ "$owner" == 0 || "$owner" == "$OPERATOR_UID" ]] && (( (8#$mode & 0022)==0 )) || continue
+        owner=$(file_stat owner "$candidate") && mode=$(file_stat mode "$candidate") || continue
+        trusted_tool_owner "$owner" && (( (8#$mode & 0022)==0 )) || continue
         printf '%s\n' "$candidate"; return
     done
-    fail 3 "$name is unavailable in configured tool directories; it must be executable, owned by root or this user, and not group/world writable"
+    fail 3 "$name is unavailable in configured tool directories; it must be executable, owned by root or this user or a TRUSTED_TOOL_USERS account, and not group/world writable"
 }
 initialise() {
     local os_version=

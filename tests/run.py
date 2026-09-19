@@ -94,6 +94,25 @@ for tool_owner in 0 "$OPERATOR_UID"; do
 done
 ''')
 
+    def test_tool_discovery_accepts_configured_owner_but_rejects_writable_tools(self):
+        self.shell(r'''
+tool_owner=$OPERATOR_UID
+TRUSTED_TOOL_USERS=$(/usr/bin/id -un "$tool_owner")
+OPERATOR_UID=999998
+file_stat() {
+    case "$1" in owner) printf '%s\n' "$tool_owner" ;; mode) printf '%s\n' "$tool_mode" ;; esac
+}
+tool_mode=555
+found=$(find_tool sh) || exit
+[[ -x "$found" ]] || exit 1
+for tool_mode in 775 757 777; do
+    if find_tool sh; then exit 1; fi
+done
+tool_mode=555
+TRUSTED_TOOL_USERS=untrusted_fixture_account
+if find_tool sh; then exit 1; fi
+''')
+
     def test_file_hash_ignores_filename_escaping(self):
         def setup(root):
             for name in ('ordinary', 'with spaces', 'with\\backslash'):
@@ -2373,6 +2392,8 @@ operate <<< 1 || exit
             ('HOME_PATH=Apps Data/Hermes/Home', 'HOME_PATH=/tmp/Home'),
             ('WORKSPACE_BASE=/Volumes/Data', 'WORKSPACE_BASE=/Volumes/../Data'),
             ('TRUSTED_PATH=', 'TRUSTED_PATH=:'),
+            ('TRUSTED_TOOL_USERS=ezirius', 'TRUSTED_TOOL_USERS=501'),
+            ('TRUSTED_TOOL_USERS=ezirius', 'TRUSTED_TOOL_USERS=ezirius;root'),
             ('CONTAINER_MEMORY=2g', 'CONTAINER_MEMORY=$(touch /tmp/never-execute-config)'),
             ('MIN_SERVICE_RELEASE=v2026.9.14', 'MIN_SERVICE_RELEASE=v2026.2.30'),
             ('MIN_PODMAN_ARM64=6.1.1', 'MIN_PODMAN_ARM64=6.1.1-preview'),

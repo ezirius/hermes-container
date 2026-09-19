@@ -1,6 +1,6 @@
 # Parse a small NAME=value file without source, eval or shell expansion.
 # Keep validation here; keep every default in config/hermes-container.conf.
-CONFIG_KEYS='TRUSTED_PATH IMAGE_REPOSITORY RELEASE_REPOSITORY WORKSPACE_BASE
+CONFIG_KEYS='TRUSTED_PATH TRUSTED_TOOL_USERS IMAGE_REPOSITORY RELEASE_REPOSITORY WORKSPACE_BASE
 HOME_PATH BACKUPS_PATH AGENT_DOCS_PATH USER_DOCS_PATH DASHBOARD_PORTS
 CONTAINER_CPUS CONTAINER_MEMORY CONTAINER_SHM_SIZE RESTART_POLICY
 MIN_MACOS_ARM64 MIN_MACOS_AMD64 MIN_PODMAN_ARM64 MIN_PODMAN_MACOS_AMD64
@@ -23,6 +23,8 @@ config_value_valid() {
     local key=$1 value=$2 part account port seen=' '
     [[ -n "$value" && "$value" != *[[:cntrl:]]* ]] || return 1
     case "$key" in
+        TRUSTED_TOOL_USERS)
+            [[ "$value" =~ ^[a-z_][a-z0-9_-]*(\ [a-z_][a-z0-9_-]*)*$ ]] ;;
         TRUSTED_PATH)
             [[ "$value" != :* && "$value" != *: && "$value" != *::* ]] || return 1
             local directories
