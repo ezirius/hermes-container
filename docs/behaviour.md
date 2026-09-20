@@ -12,16 +12,24 @@ known key must appear once. Unknown keys, duplicates, empty required values, inv
 invalid ports, invalid release dates, binary input and inconsistent timeouts are
 refused. Errors distinguish unknown names, duplicates and invalid values.
 Conflicting timeouts name the keys that need changing.
+Endpoint hosts must be DNS names or full IPv4 addresses. Malformed numeric
+addresses are configuration errors, so they cannot trigger offline fallback.
+Shared memory cannot exceed container memory. Process polling and cancellation
+grace must be shorter than every command timeout, and release connection timeout
+cannot exceed release timeout.
 `TRUSTED_TOOL_USERS` may be empty to disable additional trusted tool owners.
 Settings are read into one snapshot at command startup; environment values do not override
-them. `--check-config` validates the file without a terminal or Podman.
+them.
 
 Paths, ports, resources, release sources, version requirements, retention,
 timeouts and input limits are configurable. Registry/release origins, release
 page size, terminal fallback and process supervision intervals also live in the
-configuration file. JSON input, captured stdout and captured stderr have separate
+configuration file. Container Home, maintenance timezone, dashboard bind/listen
+addresses and temporary diagnostics directories also come from this file.
+JSON input, captured stdout and captured stderr have separate
 size limits. Values stated below describe the
-shipped defaults. Host paths do not change the image's native `/opt/data` contract.
+shipped defaults. `CONTAINER_HOME` must match the image's native home; it defaults
+to `/opt/data`. Changing the value does not modify the image.
 Security checks (ownership, permissions, loopback-only publishing, no implicit
 pulls, no automatic recovery) remain mandatory behavior. Stop before changing
 service settings or paths; no automatic migration or recreation is performed.
@@ -67,7 +75,8 @@ writable. This allows the shared Homebrew installation without changing its owne
 The error names the tool and explains these requirements.
 
 The engine must be native rootless Linux with cgroups v2, at least 2 CPUs and
-6 GiB RAM. Containers receive 1 CPU, 2 GiB RAM and 512 MiB shared memory. Linux
+6 GiB RAM. If the configured container needs more, both engine and VM checks use
+the larger allocation. Containers receive 1 CPU, 2 GiB RAM and 512 MiB shared memory. Linux
 uses the local engine with `--remote=false`. macOS requires an already running,
 rootless Podman VM and a matching default connection; the connection is fixed
 for subsequent commands. The launcher does not install tools or upgrade,
@@ -137,7 +146,9 @@ Broken links, unsafe target permissions and replaced paths are refused.
 Neither resolved Docs directory may
 equal, contain or sit inside Hermes Home: Docs are working files, while Home is private
 and backed up. Backups must not equal, contain or sit inside Home or either Docs
-directory, including through symlinks. Private launcher records and locks
+directory, including through symlinks. Inside the container, Docs targets must not overlap each
+other or `CONTAINER_HOME`; this prevents one bind mount from hiding another.
+Private launcher records and locks
 still require regular files/directories. New
 directories use 0700; records and archives use 0600. Existing safe Home/Docs
 permissions are preserved. Missing source directories are created after locking.
@@ -192,8 +203,10 @@ Temporary containers replace `service` with `setup`, `backup` or `import`.
 The creation timestamp stays unchanged on reuse. Discovery uses workspace and
 service labels and refuses duplicate matches. Podman records its identity and
 configuration; the launcher adds no service-state file. The container runs native `gateway run`, with the dashboard enabled under s6, four
-persistent mounts and one loopback-only published dashboard port. Account port
-offsets are +10000 for Ezirius, +20000 for Nala and +50000 otherwise, from 9119.
+persistent mounts and one loopback-only published dashboard port. The configured
+default ports are 19119 for Ezirius, 29119 for Nala and 59119 otherwise, mapping
+to container port 9119. Host ports are explicit settings; changing the container
+port does not recalculate them.
 The native gateway API is not published. Saved Hermes authentication is retained.
 
 The launcher checks container name, image digest, labels, command, mounts,
@@ -210,6 +223,8 @@ not stop the service. Start requires one unambiguous JSON object from `/api/stat
 with enabled authentication and non-empty provider names,
 then prints the container name and URL; messaging platform connectivity and actual login are not
 proven by that check. Inspect `podman logs <full-container-name>` if startup fails.
+Dashboard retries use `DASHBOARD_POLL_SECONDS` between attempts, with no delay
+after the last failure. Retry delays can be cancelled just like HTTP requests.
 Paths, image configuration and container identity are rechecked after release
 checks and before reporting readiness. A responding HTTP endpoint alone does not
 count as proof that the expected service container is still running.
@@ -253,10 +268,11 @@ inspected, and this header check is not a database-integrity check.
 5. Save the selected-image configuration atomically **before** it can change Home,
    then run setup or start the shared gateway/dashboard service. Failure keeps this selection and the backup. No automatic
    rollback or interrupted-operation repair takes place.
-6. After successful setup/update, prune verified backups older than 14 days.
+6. After successful setup/update, prune verified backups older than the configured
+   retention period (14 days by default).
    Cleanup failure warns without undoing the session.
 
-Release requests use fixed HTTPS origins, no redirects, bounded sizes/timeouts
+Release requests use the configured HTTPS origins, no redirects, bounded sizes/timeouts
 and complete sequential pagination. Registry tokens use private temporary curl
 configuration. Tag drift and downgrades are refused. An unavailable release
 check may use the configured cached image; first setup cannot use that
@@ -265,15 +281,15 @@ types and oversized responses are errors, not offline fallback conditions.
 Invalid or inconsistent release metadata prints an error before stopping.
 An unavailable first check reports that setup/restore needs an online image selection.
 
-Images come from `docker.io/nousresearch/hermes-agent` and run by digest with
+Images default to `docker.io/nousresearch/hermes-agent` and run by digest with
 `--pull=never`. Maintenance containers use `--rm`; the service instead uses
-`-d --restart=unless-stopped`. Setup attaches to the terminal; chat uses exec in
+`-d` and the configured restart policy (`unless-stopped` by default). Setup attaches to the terminal; chat uses exec in
 the service. Only the loopback dashboard port is published. No host sockets or
 privileged mode are added. The official entrypoint drops to the operator UID/GID;
 Linux uses `--userns=keep-id --user=0:0` and shared SELinux labels for Docs.
 
 The Agent Docs path is Hermes' working directory and file-tool write-safe root.
-Initialisation starts in `/opt/data` because the image's s6 startup mishandles
+Initialisation starts in `CONTAINER_HOME` (normally `/opt/data`) because the image's s6 startup mishandles
 spaces in its initial working directory. For setup, a shell enters the quoted
 `TERMINAL_CWD` after the privilege drop; chat exec sets its working directory
 directly. The gateway receives Agent Docs through `TERMINAL_CWD`. Root/profile
@@ -299,9 +315,9 @@ It uses the same lock, inventory, native capture and verification checks as a
 pre-update backup. A failed backup does not trigger retention.
 
 The configured image runs `hermes backup --keep 0 --output` into a new
-`/opt/data/backups/.pending-<operation>` directory. Home and the separate Backups
+`<CONTAINER_HOME>/backups/.pending-<operation>` directory. Home and the separate Backups
 directory are mounted for backup; Docs are not. TMPDIR stays inside staging and
-TZ is UTC. Native Hermes excludes its
+TZ uses `MAINTENANCE_TIMEZONE` (UTC by default). Native Hermes excludes its
 `backups` subtree; host verification rejects archives containing it. The native
 name remains `hermes-backup-YYYY-MM-DD-HHMMSS.zip`; its receipt uses
 `hermes-backup-YYYY-MM-DD-HHMMSS-receipt.json`. Existing archive or receipt

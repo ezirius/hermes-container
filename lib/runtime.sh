@@ -143,6 +143,11 @@ require_disk_space() {
 }
 host_readiness() {
     local digest=$1 version info client_version engine_version machine_info detail graph backing guest required=$((NEW_IMAGE_FREE_GIB*1073741824)) status quoted
+    local required_cpus=$MIN_ENGINE_CPUS required_memory=$MIN_ENGINE_MEMORY_MIB container_memory
+    # A custom container allocation can exceed the usual engine minimums.
+    ((CONTAINER_CPUS<=required_cpus)) || required_cpus=$CONTAINER_CPUS
+    container_memory=$(( $(config_bytes "$CONTAINER_MEMORY") / 1048576 ))
+    ((container_memory<=required_memory)) || required_memory=$container_memory
     version=$(podman_json version --format json) || return
     client_version=$(printf '%s' "$version" | json -er '.Client.Version | select(type=="string")') || return 3
     version_at_least "$client_version" "$REQUIRED_PODMAN" || {
@@ -153,13 +158,13 @@ host_readiness() {
     version_at_least "$engine_version" "$REQUIRED_PODMAN" || {
         fail 3 "Podman engine $REQUIRED_PODMAN or newer is required; found $engine_version"; return
     }
-    printf '%s' "$info" | json -e --arg native "$NATIVE" --argjson cpus "$MIN_ENGINE_CPUS" \
-      --argjson memory "$((MIN_ENGINE_MEMORY_MIB*1048576))" '
+    printf '%s' "$info" | json -e --arg native "$NATIVE" --argjson cpus "$required_cpus" \
+      --argjson memory "$((required_memory*1048576))" '
       .host.os=="linux" and .host.arch==$native
       and .host.cgroupVersion=="v2" and .host.security.rootless==true
       and (.host.cpus|type)=="number" and (.host.cpus|floor)==.host.cpus and .host.cpus>=$cpus
       and (.host.memTotal|type)=="number" and (.host.memTotal|floor)==.host.memTotal
-      and .host.memTotal>=$memory' >/dev/null || { fail 3 "engine must be native/rootless Linux, version $REQUIRED_PODMAN or newer, cgroups v2, $MIN_ENGINE_CPUS CPUs and $MIN_ENGINE_MEMORY_MIB MiB"; return; }
+      and .host.memTotal>=$memory' >/dev/null || { fail 3 "engine must be native/rootless Linux, version $REQUIRED_PODMAN or newer, cgroups v2, $required_cpus CPUs and $required_memory MiB"; return; }
     graph=$(printf '%s' "$info" | json -er '.store.graphRoot | select(type=="string" and startswith("/"))') || return 3
     if [[ "$HOST_OS" == Linux ]]; then
         printf '%s' "$info" | json -e '.host.serviceIsRemote==false' >/dev/null || { fail 3 'Linux requires the local Podman engine'; return; }
@@ -174,15 +179,15 @@ host_readiness() {
         }
         detail=$(podman_json machine inspect "$MACHINE") || return
         # jq orders strings and objects above numbers; check types before limits.
-        printf '%s' "$detail" | json -e --arg machine "$MACHINE" --argjson cpus "$MIN_ENGINE_CPUS" \
-          --argjson memory "$MIN_ENGINE_MEMORY_MIB" '
+        printf '%s' "$detail" | json -e --arg machine "$MACHINE" --argjson cpus "$required_cpus" \
+          --argjson memory "$required_memory" '
           type=="array" and length==1 and .[0].Name==$machine
           and .[0].State=="running" and .[0].Rootful==false
           and (.[0].Resources.CPUs|type)=="number"
           and (.[0].Resources.CPUs|floor)==.[0].Resources.CPUs and .[0].Resources.CPUs>=$cpus
           and (.[0].Resources.Memory|type)=="number"
           and (.[0].Resources.Memory|floor)==.[0].Resources.Memory and .[0].Resources.Memory>=$memory
-        ' >/dev/null || { fail 3 "Podman machine resources are invalid or below $MIN_ENGINE_CPUS CPUs and $MIN_ENGINE_MEMORY_MIB MiB"; return; }
+        ' >/dev/null || { fail 3 "Podman machine resources are invalid or below $required_cpus CPUs and $required_memory MiB"; return; }
         # machine ssh crosses a shell boundary. Allow hidden directories such as
         # .local, but refuse shell punctuation and whitespace before passing a path.
         [[ "$graph" =~ ^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+/?$ ]] || {
@@ -338,7 +343,7 @@ build_runtime() {
         --label "com.ezirius.hermesagent.operation=$OPERATION_ID"
     )
     workdir=$CONTAINER_DOCS
-    [[ "$action" != backup && "$action" != import ]] || workdir=/opt/data
+    [[ "$action" != backup && "$action" != import ]] || workdir=$CONTAINER_HOME
     RUNTIME+=(
         --env "HERMES_UID=$OPERATOR_UID" --env "HERMES_GID=$OPERATOR_GID"
         --env TERMINAL_ENV=local --env "TERMINAL_CWD=$workdir"
@@ -346,35 +351,35 @@ build_runtime() {
     )
     if [[ "$action" == service ]]; then
         # The official image supervises gateway and dashboard together.
-        RUNTIME+=(--env HERMES_DASHBOARD=1 --env HERMES_DASHBOARD_HOST=0.0.0.0
+        RUNTIME+=(--env HERMES_DASHBOARD=1 --env "HERMES_DASHBOARD_HOST=$DASHBOARD_LISTEN_IP"
             --env "HERMES_DASHBOARD_PORT=$DASHBOARD_CONTAINER_PORT"
-            --publish "127.0.0.1:$(dashboard_port):$DASHBOARD_CONTAINER_PORT")
+            --publish "$DASHBOARD_BIND_IP:$(dashboard_port):$DASHBOARD_CONTAINER_PORT")
     else
         RUNTIME+=(--env HERMES_DASHBOARD=0)
     fi
-    home_mount=$(mount_value "$data" /opt/data) || return
+    home_mount=$(mount_value "$data" "$CONTAINER_HOME") || return
     RUNTIME+=(--mount "$home_mount")
     # Keep Hermes' native backup path, but store it in the separate host Backups.
     # Staged import gets an isolated Home; live import uses persistent Backups too.
     if [[ "$action" != import || "$data" == "$HERMES_DATA" ]]; then
-        RUNTIME+=(--mount "$(mount_value "$BACKUPS" /opt/data/backups)")
+        RUNTIME+=(--mount "$(mount_value "$BACKUPS" "$CONTAINER_BACKUPS")")
     fi
     if [[ "$action" == backup ]]; then
         [[ "$output" == "$BACKUPS/"* ]] || { fail 4 'backup output must be inside Backups'; return; }
-        backup_output=/opt/data/backups/${output#"$BACKUPS/"}
-        RUNTIME+=(--env TZ=UTC --env "TMPDIR=$backup_output/tmp" --workdir=/opt/data)
+        backup_output=$CONTAINER_BACKUPS/${output#"$BACKUPS/"}
+        RUNTIME+=(--env "TZ=$MAINTENANCE_TIMEZONE" --env "TMPDIR=$backup_output/tmp" --workdir="$CONTAINER_HOME")
     elif [[ "$action" == import ]]; then
         # Restore has no Docs mounts or network. The input ZIP is read-only.
-        RUNTIME+=(--network=none --workdir=/opt/data --env TZ=UTC
+        RUNTIME+=(--network=none --workdir="$CONTAINER_HOME" --env "TZ=$MAINTENANCE_TIMEZONE"
             --mount "$(mount_value "$output" /import.zip shared ro)")
     else
         # Both Docs sources are mounted; Agent Docs is the default directory.
         docs_mount=$(mount_value "$DOCUMENTS" "$CONTAINER_DOCS" shared) || return
         user_docs_mount=$(mount_value "$USER_DOCUMENTS" "$CONTAINER_USER_DOCS" shared) || return
         # s6 startup splits a working directory containing spaces. Start it in
-        # /opt/data, then change directory after the official privilege drop.
+        # Hermes Home, then change directory after the official privilege drop.
         [[ "$action" == service ]] || RUNTIME+=(-it)
-        RUNTIME+=(--mount "$docs_mount" --mount "$user_docs_mount" --workdir=/opt/data)
+        RUNTIME+=(--mount "$docs_mount" --mount "$user_docs_mount" --workdir="$CONTAINER_HOME")
     fi
     RUNTIME+=("$IMAGE@$digest")
     case "$action" in

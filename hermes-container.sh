@@ -10,12 +10,11 @@ usage() {
     /bin/cat <<'USAGE'
 Usage: hermes-container.sh [start|chat|stop|setup|backup] [workspace]
        hermes-container.sh restore [workspace] [backup.zip]
-       hermes-container.sh --help|-h|--check-config
+       hermes-container.sh --help|-h
 
 No arguments: start or reuse Hermes, then open chat in its container.
 setup: configure Hermes; first setup offers restore or new setup.
 start: start or reuse the shared service, then show its name and dashboard URL.
---check-config: validate config/hermes-container.conf without starting Hermes.
 stop: stop gateways and remove the service container; keep all host data.
 backup: create a native Hermes backup using the configured image.
 restore: restore a ZIP; omit its path to choose from saved backups.
@@ -32,7 +31,6 @@ parse_args() {
     if (($#==1)); then
         case "$1" in
             --help|-h) ACTION=help; return ;;
-            --check-config) ACTION=check-config; return ;;
         esac
     fi
     ACTION=$1
@@ -107,8 +105,11 @@ initialise() {
     safe_path "$RUNTIME_BASE" directory 700 || { fail 3 "private runtime directory unavailable: $RUNTIME_BASE"; return; }
     APPLE=
     [[ "$HOST_OS" == Darwin && "$NATIVE" == arm64 ]] && APPLE=$(find_tool container 2>/dev/null) || :
-    TEMP_BASE=/tmp
-    [[ "$HOST_OS" != Darwin ]] || TEMP_BASE=/private/tmp
+    TEMP_BASE=$TEMP_BASE_LINUX
+    [[ "$HOST_OS" != Darwin ]] || TEMP_BASE=$TEMP_BASE_MACOS
+    [[ -d "$TEMP_BASE" && -w "$TEMP_BASE" && -x "$TEMP_BASE" ]] || {
+        fail 3 "temporary directory must exist and be writable: $TEMP_BASE"; return
+    }
     SCRATCH=$(/usr/bin/mktemp -d "$TEMP_BASE/hermesagent.XXXXXXXX") || return
     SCRATCH_INODE=$(identity "$SCRATCH") || return
     CAPTURE_NUMBER=0; CHILD_PID=; INTERRUPTED=
@@ -211,11 +212,6 @@ main() {
         return 2
     }
     if [[ "$ACTION" == help ]]; then usage; return; fi
-    if [[ "$ACTION" == check-config ]]; then
-        load_launcher_config "$CODE_DIR/config/hermes-container.conf" || return
-        success "Configuration is valid: $CODE_DIR/config/hermes-container.conf"
-        return
-    fi
     initialise && {
         case "$ACTION" in
             backup) operate_backup ;;

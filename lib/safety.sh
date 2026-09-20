@@ -48,6 +48,10 @@ sha256() {
 file_hash() { sha256 < "$1" | /usr/bin/awk '{print $1}'; }
 new_token() { /usr/bin/od -An -N16 -tx1 /dev/urandom | /usr/bin/tr -d ' \n'; }
 exists() { [[ -e "$1" || -L "$1" ]]; }
+# Call with absolute, normalized paths. Equal paths and either ancestor overlap.
+paths_overlap() {
+    [[ "$1" == "$2" || "$1" == "$2/"* || "$2" == "$1/"* || "$1" == / || "$2" == / ]]
+}
 canonical_path() {
     local path=$1 parent tail target count=${2:-0}
     [[ "$path" == /* ]] || return 1

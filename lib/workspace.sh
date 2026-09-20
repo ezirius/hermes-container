@@ -163,20 +163,30 @@ verify_source_paths() {
     }
     # Resolved Docs must not expose private Home or become part of its backups.
     for path in "$DOCUMENTS" "$USER_DOCUMENTS"; do
-        if [[ "$path" == "$HERMES_DATA" || "$path" == "$HERMES_DATA/"* ||
-              "$HERMES_DATA" == "$path/"* || "$path" == / || "$HERMES_DATA" == / ]]; then
+        if paths_overlap "$path" "$HERMES_DATA"; then
             fail 4 "Docs must not overlap Hermes Home: $path"
             return
         fi
     done
     # Backups must stay separate from all data directories, including aliases.
     for path in "$HERMES_DATA" "$DOCUMENTS" "$USER_DOCUMENTS"; do
-        if [[ "$BACKUPS" == "$path" || "$BACKUPS" == "$path/"* ||
-              "$path" == "$BACKUPS/"* || "$path" == / || "$BACKUPS" == / ]]; then
+        if paths_overlap "$BACKUPS" "$path"; then
             fail 4 "Backups must not overlap Home or Docs: $BACKUPS"
             return
         fi
     done
+    # Host sources can be separate while their container targets hide each other.
+    # Home contains the intentional Backups submount; Docs must stay outside it.
+    for path in "$CONTAINER_DOCS" "$CONTAINER_USER_DOCS"; do
+        if paths_overlap "$path" "$CONTAINER_HOME"; then
+            fail 4 "container Docs path must not overlap container Home: $path"
+            return
+        fi
+    done
+    if paths_overlap "$CONTAINER_DOCS" "$CONTAINER_USER_DOCS"; then
+        fail 4 'Agent Docs and User Docs must have separate container paths'
+        return
+    fi
     for ((index=0; index<${#SOURCE_PIN_PATHS[@]}; index++)); do
         [[ "$(source_identity "${SOURCE_PIN_PATHS[index]}")" == "${SOURCE_PIN_IDS[index]}" ]] || {
             fail 4 "mount source directory changed: ${SOURCE_PIN_PATHS[index]}"

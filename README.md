@@ -9,7 +9,6 @@ Keep `hermes-container.sh`, `config/` and `lib/` together. Run Hermes Container 
 ordinary account, from a terminal.
 
 ```sh
-./hermes-container.sh --check-config     # Check Hermes Container settings without starting anything
 ./hermes-container.sh setup              # Select your workspace and configure Hermes
 ./hermes-container.sh                    # Start or reuse Hermes, then open chat
 ```
@@ -42,7 +41,6 @@ At numbered menus, enter a number or `q` to quit.
 | `./hermes-container.sh setup ezirius` | Configure Hermes or repeat setup |
 | `./hermes-container.sh backup ezirius` | Create and verify a native Hermes backup |
 | `./hermes-container.sh restore ezirius` | Choose and restore a saved backup |
-| `./hermes-container.sh --check-config` | Validate Hermes Container settings without running Hermes |
 | `./hermes-container.sh --help` | Show command syntax |
 
 Omit the workspace to select it from a menu. To restore a particular archive:
@@ -57,10 +55,14 @@ before setup, backup or restore. Stop preserves Home, documents and backups.
 ## Configuration
 
 Edit **[config/hermes-container.conf](config/hermes-container.conf)** for Hermes Container settings. It
-contains paths, image sources, ports, container resources, host requirements,
-backup retention, timeouts and input limits. The advanced sections also hold
-service endpoints, release page size and process polling intervals. Defaults are
-defined there once. Scripts read the settings and perform the work.
+contains all editable launcher settings: paths, image sources, dashboard addresses
+and ports, container resources, host requirements, backup retention, timeouts and
+input limits. Defaults are defined there once. Scripts validate the settings and
+perform the work.
+
+Start with the **Host storage**, **Dashboard host ports** and container resource
+settings. The image integration and service endpoint settings are advanced;
+leave them at their defaults when using the supplied Hermes image.
 
 Use `NAME=value`, with no quotes around values. Spaces in paths are literal.
 Put comments on separate lines. The file is read as data: shell commands,
@@ -70,10 +72,16 @@ unknown names, duplicates and invalid values identify the setting and its file
 location. Missing settings and conflicting timeouts name the keys to fix. Binary
 files are refused.
 
-After editing, run `./hermes-container.sh --check-config`. It checks syntax,
-values and timeout relationships. It does not check your installed tools, VM,
-network or data. Settings are read once per command; edits apply to the next run.
+Settings are validated at command startup, including syntax, values and timeout
+relationships. Shared memory cannot exceed the container memory limit. Process
+polling and cancellation grace must be shorter than the shortest command timeout.
+Settings are read once per command; edits apply to the next run.
 Environment variables do not replace these settings.
+
+Safety rules remain in code: host dashboard access stays on loopback, restore
+input is read-only, and imports have no network. Protocol details such as Hermes
+command names, backup filenames and JSON record fields are also fixed. These
+are not optional launcher settings.
 
 `TRUSTED_TOOL_USERS=ezirius` allows tools from the shared Homebrew installation
 owned by `ezirius`. Root and the current user are also trusted. Additional account
@@ -113,12 +121,18 @@ For account `ezirius`, the default paths are:
 
 Linux uses the account's actual home for User Docs. Safe source symlinks are
 supported. Home, Backups and Docs must remain separate; resolved paths and
-ownership are checked. The container's `/opt/data` layout is part of the Hermes
-image contract. Host locations are configurable.
+ownership are checked. Container Docs targets must not overlap each other or
+container Home. `CONTAINER_HOME=/opt/data` matches the supplied image. Change it
+only when using a compatible image built for another home; changing this setting
+does not relocate an image's internal files. Backups mount below it at `backups/`.
 
 The dashboard is published only on host loopback. Default host ports are `19119`
 for Ezirius, `29119` for Nala and `59119` for other accounts. Edit
-`DASHBOARD_PORTS` to change them. Start prints the URL after checking that the
+`DASHBOARD_PORTS` to change them. `DASHBOARD_BIND_IP` must be an IPv4 loopback
+address; `DASHBOARD_LISTEN_IP` is the address inside the container. Its default,
+`0.0.0.0`, lets Podman's published port reach the dashboard.
+Container loopback and multicast listen addresses are refused.
+Start prints the URL after checking that the
 dashboard reports authentication. Use your saved Hermes login; see the
 [Hermes dashboard instructions](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard#authentication).
 This readiness check does not prove login or messaging integrations work.
@@ -164,7 +178,9 @@ Bash 3.2+, jq 1.7+, curl and unzip are required; production does not use host Py
 Tools must belong to root, your account or a configured `TRUSTED_TOOL_USERS`
 account, and must not be group/world writable.
 The default engine requirement is native, rootless Linux with cgroups v2,
-2 CPUs and 6 GiB RAM. macOS needs an already running Podman VM sharing the data
+2 CPUs and 6 GiB RAM. A larger configured container requires at least that many
+CPUs and that much memory in both the engine and the macOS VM.
+macOS needs an already running Podman VM sharing the data
 paths. Hermes Container does not install tools or configure or start that VM.
 
 If startup fails, inspect `podman logs <container-name>`. If a lock or failed
@@ -182,7 +198,7 @@ The checks cover standard session and Kanban paths, not custom database location
 Read `main()` in `hermes-container.sh`, then the named functions in `lib/`.
 `lib/config.sh` parses and validates settings. Other libraries handle workspaces,
 Podman, services, releases, backups and restore. JSON validators are in `lib/*.jq`.
-The separate Python worktree is not part of Hermes Container.
+The separate `hermes-container-python/` worktree is ignored by this Bash repository.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 tests/run.py

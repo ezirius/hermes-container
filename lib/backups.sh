@@ -1,6 +1,7 @@
 # Hermes creates archives. The host verifies them and applies the configured retention period.
 validate_zip() {
     local archive=$1 name member previous= found=false
+    operation_active || return
     safe_path "$archive" file 600 || return
     [[ -s "$archive" ]] || return 4
     run_capture "$ZIP_TEST_TIMEOUT" /usr/bin/unzip -t -P '' "$archive" || return 4
@@ -11,21 +12,23 @@ validate_zip() {
     run_capture "$ZIP_LIST_TIMEOUT" /usr/bin/unzip -Z -1 "$archive" || return 4
     /usr/bin/sort "$CAPTURE_OUT" > "$SCRATCH/members" || return
     while IFS= read -r name; do
+        operation_active || return
         [[ -n "$name" && "$name" != /* && "$name" != *\\* && "$name" != "$previous" ]] || return 4
         member=${name%/}
         # Native Hermes must exclude its backups directory, including old archives.
         case "$name" in backups|backups/*) return 4 ;; esac
         case "/$member/" in */../*|*/./*|*//* ) return 4 ;; esac
-        printf '%s' "$name" | json -Rse 'test("[\\p{Cc}\\p{Cf}\\p{Cs}\\p{Zl}\\p{Zp}]") | not' >/dev/null || return 4
         case "$name" in config.yaml|.env|state.db) found=true ;; esac
         previous=$name
     done < "$SCRATCH/members"
+    # Check Unicode names together, without starting jq once for every file.
     # A valid ZIP can still be impossible to restore: a file cannot also be
     # a directory or the parent of another member (for example, config.yaml/x).
     json -Rse '
         split("\n") | map(select(length > 0)) as $names
         | (reduce $names[] as $name ({}; .[$name] = true)) as $entries
-        | all($names[]; split("/") as $parts
+        | all($names[]; test("[\\p{Cc}\\p{Cf}\\p{Cs}\\p{Zl}\\p{Zp}]") | not)
+        and all($names[]; split("/") as $parts
             | all(range(1; $parts | length);
                   $entries[$parts[:.] | join("/")] | not))
     ' "$SCRATCH/members" >/dev/null || return 4
@@ -39,7 +42,7 @@ native_output_clean() {
       END {exit bad ? 1 : 0}' "$@"
 }
 backup_output_ok() {
-    local directory=$1 name=$2 destination=${3:-/backup}
+    local directory=$1 name=$2 destination=$3
     safe_path "$directory/exit" file 600 &&
         safe_path "$directory/stdout" file 600 &&
         safe_path "$directory/stderr" file 600 || return
@@ -116,7 +119,7 @@ create_backup() {
     }
     archive=$directory/$name
     /bin/chmod 600 "$archive" || return
-    backup_output_ok "$directory" "$name" "/opt/data/backups/${directory#"$BACKUPS/"}" && validate_zip "$archive" || {
+    backup_output_ok "$directory" "$name" "$CONTAINER_BACKUPS/${directory#"$BACKUPS/"}" && validate_zip "$archive" || {
         fail 4 "backup verification failed; capture preserved: $directory"; return
     }
     hash=$(file_hash "$archive") || return

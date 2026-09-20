@@ -87,8 +87,8 @@ import_output_clean() {
     local data=$1 new_config=$2 stdout=$3 stderr=$4
     native_output_clean "$stdout" "$stderr" && return 0
     [[ "$new_config" == true ]] || return 4
-    /usr/bin/awk '
-      $0 == "[config-migrate] WARNING: This config predates version 12 (~2 years old) and can no longer be auto-migrated. Back up /opt/data/config.yaml and run `hermes setup` to regenerate, or manually set _config_version: 12 after reviewing the changelog." {next}
+    /usr/bin/awk -v home="$CONTAINER_HOME" '
+      $0 == "[config-migrate] WARNING: This config predates version 12 (~2 years old) and can no longer be auto-migrated. Back up " home "/config.yaml and run `hermes setup` to regenerate, or manually set _config_version: 12 after reviewing the changelog." {next}
       {print}' "$stderr" > "$SCRATCH/import-stderr" || return
     native_output_clean "$stdout" "$SCRATCH/import-stderr" || return
     safe_path "$data/config.yaml" file || return

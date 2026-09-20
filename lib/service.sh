@@ -36,7 +36,7 @@ check_service_database() {
 }
 show_dashboard() {
     printf 'Container: %s\n' "$(service_name)" >&2
-    printf 'Dashboard: http://127.0.0.1:%s\nUse your saved Hermes login.\nClosing chat leaves the service container running.\n\n' "$(dashboard_port)" >&2
+    printf 'Dashboard: http://%s:%s\nUse your saved Hermes login.\nClosing chat leaves the service container running.\n\n' "$DASHBOARD_BIND_IP" "$(dashboard_port)" >&2
 }
 find_service() {
     local listing raw expected digest tag slug
@@ -59,8 +59,9 @@ find_service() {
     slug=$(container_slug) || return
     expected=$(json -n --arg home "$HERMES_DATA" --arg backups "$BACKUPS" \
         --arg docs "$DOCUMENTS" --arg user "$USER_DOCUMENTS" \
-        --arg docs_target "$CONTAINER_DOCS" --arg user_target "$CONTAINER_USER_DOCS" '
-        [{Source:$home,Destination:"/opt/data"}, {Source:$backups,Destination:"/opt/data/backups"},
+        --arg docs_target "$CONTAINER_DOCS" --arg user_target "$CONTAINER_USER_DOCS" \
+        --arg home_target "$CONTAINER_HOME" --arg backups_target "$CONTAINER_BACKUPS" '
+        [{Source:$home,Destination:$home_target}, {Source:$backups,Destination:$backups_target},
          {Source:$docs,Destination:$docs_target}, {Source:$user,Destination:$user_target}] | sort_by(.Destination)') || return
     # Never adopt or remove a container just because its name happens to match.
     printf '%s' "$raw" | json -e --arg prefix "hermes-$tag-" \
@@ -68,6 +69,8 @@ find_service() {
         --arg image "$IMAGE@$digest" --arg hash "$WORKSPACE_HASH" --arg digest "$digest" \
         --arg uid "$OPERATOR_UID" --arg gid "$OPERATOR_GID" --arg port "$(dashboard_port)" \
         --arg docs_target "$CONTAINER_DOCS" --arg container_port "$DASHBOARD_CONTAINER_PORT" \
+        --arg home_target "$CONTAINER_HOME" --arg bind_ip "$DASHBOARD_BIND_IP" \
+        --arg listen_ip "$DASHBOARD_LISTEN_IP" \
         --arg restart "$RESTART_POLICY" --argjson cpus "$CONTAINER_CPUS" \
         --argjson memory "$(config_bytes "$CONTAINER_MEMORY")" \
         --argjson shm "$(config_bytes "$CONTAINER_SHM_SIZE")" \
@@ -100,7 +103,7 @@ wait_dashboard() {
     for ((attempt=0; attempt<DASHBOARD_ATTEMPTS; attempt++)); do
         operation_active || return
         if run_capture "$DASHBOARD_CAPTURE_TIMEOUT" "$CURL" --disable --silent --show-error --fail --noproxy '*' \
-            --connect-timeout "$DASHBOARD_CONNECT_TIMEOUT" --max-time "$DASHBOARD_HTTP_TIMEOUT" "http://127.0.0.1:$(dashboard_port)/api/status"; then
+            --connect-timeout "$DASHBOARD_CONNECT_TIMEOUT" --max-time "$DASHBOARD_HTTP_TIMEOUT" "http://$DASHBOARD_BIND_IP:$(dashboard_port)/api/status"; then
             if dashboard_authenticated "$CAPTURE_OUT"; then
                 # An HTTP response alone does not prove our container survived.
                 refresh_service || return
@@ -110,7 +113,14 @@ wait_dashboard() {
                 return 0
             fi
         fi
-        /bin/sleep "$DASHBOARD_POLL_SECONDS"
+        # Preserve cancellation even when there is no next attempt.
+        operation_active || return
+        # No delay is needed after the last request. Supervise retry sleeps so
+        # cancellation can stop them, even when a long interval is configured.
+        if ((attempt+1<DASHBOARD_ATTEMPTS)); then
+            # One extra second allows for the integer SECONDS clock boundary.
+            run_capture "$((DASHBOARD_POLL_SECONDS+1))" /bin/sleep "$DASHBOARD_POLL_SECONDS" || return
+        fi
     done
     fail 3 "dashboard is not ready with authentication; inspect: podman logs $(service_name)"
 }
@@ -178,7 +188,7 @@ service_chat() {
     operation_active || return
     # exec joins the existing container; closing this session never stops it.
     /usr/bin/env -i "${CHILD_ENV[@]}" TERM="${TERM:-$DEFAULT_TERM}" "$PODMAN" "${PODMAN_OPTIONS[@]}" \
-        exec -it --user "$OPERATOR_UID:$OPERATOR_GID" --env HOME=/opt/data \
+        exec -it --user "$OPERATOR_UID:$OPERATOR_GID" --env "HOME=$CONTAINER_HOME" \
         --workdir "$CONTAINER_DOCS" "$SERVICE_ID" hermes <&0 &
     CHILD_PID=$!
     wait "$CHILD_PID"; status=$?

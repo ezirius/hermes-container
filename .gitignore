@@ -6,7 +6,7 @@ __pycache__/
 .DS_Store
 
 # Keep the separate Python worktree out of the Bash branch
-/hermes-podman-launcher-python/
+/hermes-container-python/
 
 # Local environment and credentials
 .env

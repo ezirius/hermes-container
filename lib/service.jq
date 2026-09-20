@@ -11,10 +11,10 @@ type=="array" and length==1 and (.[0] |
   and .Config.Labels["com.ezirius.hermesagent.action"]=="service"
   and .Config.Labels["com.ezirius.hermesagent.workspace_hash"]==$hash
   and .Config.Labels["com.ezirius.hermesagent.digest"]==$digest
-  and .Config.Cmd==["gateway","run"] and .Config.WorkingDir=="/opt/data"
+  and .Config.Cmd==["gateway","run"] and .Config.WorkingDir==$home_target
   # Reuse must keep tools in this container and in the selected Agent Docs.
   and (.Config.Env | environment and index("HERMES_DASHBOARD=1")!=null
-    and index("HERMES_DASHBOARD_HOST=0.0.0.0")!=null
+    and index("HERMES_DASHBOARD_HOST="+$listen_ip)!=null
     and index("HERMES_DASHBOARD_PORT="+$container_port)!=null
     and index("HERMES_UID="+$uid)!=null and index("HERMES_GID="+$gid)!=null
     and index("TERMINAL_ENV=local")!=null
@@ -29,7 +29,7 @@ type=="array" and length==1 and (.[0] |
   and .HostConfig.AutoRemove==false
   and .HostConfig.Privileged==false
   and .HostConfig.RestartPolicy.Name==$restart
-  and .HostConfig.PortBindings=={($container_port+"/tcp"):[{HostIp:"127.0.0.1",HostPort:$port}]}
+  and .HostConfig.PortBindings=={($container_port+"/tcp"):[{HostIp:$bind_ip,HostPort:$port}]}
   and ([.Mounts[] | {Source,Destination}] | sort_by(.Destination))==$mounts
   and all(.Mounts[]; .Type=="bind" and .RW==true)
   and (.State.Status|type)=="string"

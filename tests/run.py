@@ -798,13 +798,13 @@ printf '0\n' > "$SCRATCH/backup/exit"
 printf 'Backup complete: /backup/example.zip\n' > "$SCRATCH/backup/stdout"
 notice='s6-rc: warning: service s6rc-oneshot-runner is marked as essential, not stopping it'
 printf '%s\n' "$notice" > "$SCRATCH/backup/stderr"
-backup_output_ok "$SCRATCH/backup" example.zip || exit
+backup_output_ok "$SCRATCH/backup" example.zip /backup || exit
 CAPTURE_OUT=$SCRATCH/import.out; CAPTURE_ERR=$SCRATCH/backup/stderr
 printf 'Import complete: 1 files restored\n' > "$CAPTURE_OUT"
-backup_output_ok "$SCRATCH/backup" example.zip || exit
+backup_output_ok "$SCRATCH/backup" example.zip /backup || exit
 for line in '[config-migrate] WARNING: obsolete config' 'Warning: files skipped' 'SQLite safe copy failed' "$notice extra text"; do
  printf '%s\n%s\n' "$notice" "$line" > "$CAPTURE_ERR"
- if backup_output_ok "$SCRATCH/backup" example.zip; then exit 1; fi
+ if backup_output_ok "$SCRATCH/backup" example.zip /backup; then exit 1; fi
 
 done
 ''')
@@ -816,9 +816,9 @@ mkdir -m 700 "$SCRATCH/backup"
 printf '0\n' > "$SCRATCH/backup/exit"
 printf 'Backup complete: /backup/example.zip\n' > "$SCRATCH/backup/stdout"
 : > "$SCRATCH/backup/stderr"
-backup_output_ok "$SCRATCH/backup" example.zip || exit
+backup_output_ok "$SCRATCH/backup" example.zip /backup || exit
 rm "$SCRATCH/backup/stderr"
-if backup_output_ok "$SCRATCH/backup" example.zip; then exit 1; fi
+if backup_output_ok "$SCRATCH/backup" example.zip /backup; then exit 1; fi
 ''')
 
     def test_inventory_shape_and_mismatch(self):
@@ -837,7 +837,7 @@ mkdir "$SCRATCH/backup"
 printf 0 > "$SCRATCH/backup/exit"
 printf 'Backup incomplete: /backup/hermes-backup-2026-09-12-000000.zip\nWarnings: skipped\n' > "$SCRATCH/backup/stdout"
 : > "$SCRATCH/backup/stderr"
-if backup_output_ok "$SCRATCH/backup" hermes-backup-2026-09-12-000000.zip; then exit 1; fi
+if backup_output_ok "$SCRATCH/backup" hermes-backup-2026-09-12-000000.zip /backup; then exit 1; fi
 ''')
 
     def test_real_zip_and_corruption(self):
@@ -941,6 +941,16 @@ load_workspace && acquire_lock && prepare_directories || exit
                 archive.writestr('memories/nested/note.md', 'hello')
             os.chmod(root/'good.zip', 0o600)
         self.shell('validate_zip "$2/good.zip"', setup=setup)
+
+    def test_zip_many_members_and_unicode_names(self):
+        def setup(root):
+            with zipfile.ZipFile(root/'many.zip', 'w') as archive:
+                archive.writestr('config.yaml', 'model: fixture')
+                archive.writestr('notes/Ελληνικά.txt', 'hello')
+                for index in range(200):
+                    archive.writestr(f'sessions/session-{index}.json', '{}')
+            os.chmod(root/'many.zip', 0o600)
+        self.shell('validate_zip "$ACCOUNT_HOME/many.zip"', setup=setup)
 
     def test_session_changes_directory_after_init_with_literal_arguments(self):
         self.shell(r'''
@@ -1170,6 +1180,28 @@ for change in '.[0].Name="hermes-workspace"' '.[0].Name |= sub("-service-";"-cha
  json "$change" < "$SCRATCH/original" > "$SCRATCH/inspect"
  find_service; [[ $? == 4 ]] || exit 1
 done
+# Changing configuration must refuse the old container, then accept a matching one.
+cp "$SCRATCH/original" "$SCRATCH/inspect"
+CONTAINER_HOME=/srv/hermes; CONTAINER_BACKUPS=$CONTAINER_HOME/backups
+if find_service; then exit 1; fi
+json '.[0].Config.WorkingDir="/srv/hermes" |
+ .[0].Mounts |= map(if .Destination=="/opt/data" then .Destination="/srv/hermes"
+   elif .Destination=="/opt/data/backups" then .Destination="/srv/hermes/backups" else . end)' \
+ "$SCRATCH/inspect" > "$SCRATCH/custom"
+mv "$SCRATCH/custom" "$SCRATCH/inspect"
+find_service || exit
+DASHBOARD_BIND_IP=127.0.0.2
+if find_service; then exit 1; fi
+json '.[0].HostConfig.PortBindings["9119/tcp"][0].HostIp="127.0.0.2"' \
+ "$SCRATCH/inspect" > "$SCRATCH/custom"
+mv "$SCRATCH/custom" "$SCRATCH/inspect"
+find_service || exit
+DASHBOARD_LISTEN_IP=192.0.2.10
+if find_service; then exit 1; fi
+json '.[0].Config.Env |= map(if startswith("HERMES_DASHBOARD_HOST=")
+ then "HERMES_DASHBOARD_HOST=192.0.2.10" else . end)' "$SCRATCH/inspect" > "$SCRATCH/custom"
+mv "$SCRATCH/custom" "$SCRATCH/inspect"
+find_service || exit
 '''.replace('IMAGE_PLACEHOLDER', json.dumps(IMAGE)))
 
     def test_full_container_names_share_the_same_convention(self):
@@ -1572,7 +1604,7 @@ test_machine_info='{"Host":{"DefaultMachine":"fixture","MachineImageDir":"/fixtu
 podman_json() {
  case "$*" in
   'version --format json') printf '{"Client":{"Version":"6.1.1"}}' ;;
-  'info --format json') printf '{"version":{"Version":"6.1.1"},"host":{"os":"linux","arch":"arm64","cgroupVersion":"v2","security":{"rootless":true},"cpus":2,"memTotal":6442450944},"store":{"graphRoot":"/home/user/storage"}}' | json --arg graph "$test_graph" '.store.graphRoot=$graph' ;;
+  'info --format json') printf '{"version":{"Version":"6.1.1"},"host":{"os":"linux","arch":"arm64","cgroupVersion":"v2","security":{"rootless":true},"cpus":8,"memTotal":17179869184},"store":{"graphRoot":"/home/user/storage"}}' | json --arg graph "$test_graph" '.store.graphRoot=$graph' ;;
   'machine info --format json') printf '%s' "$test_machine_info" ;;
   'machine inspect fixture') json -n --argjson resources "$resources" '[{Name:"fixture",State:"running",Rootful:false,Resources:$resources}]' ;;
   *) return 99 ;;
@@ -1590,6 +1622,13 @@ run_capture() {
 free_bytes() { printf '99999999999\n'; }
 image_cached() { return 0; }
 host_readiness digest || exit
+CONTAINER_CPUS=3
+if host_readiness digest; then exit 1; fi
+CONTAINER_CPUS=1; CONTAINER_MEMORY=7g
+if host_readiness digest; then exit 1; fi
+CONTAINER_CPUS=3; resources='{"CPUs":3,"Memory":7168}'
+host_readiness digest || exit
+CONTAINER_CPUS=1; CONTAINER_MEMORY=2g; resources='{"CPUs":2,"Memory":6144}'
 test_machine_info='{"Host":{"DefaultMachine":"","CurrentMachine":"fixture","MachineImageDir":"/fixture"}}'
 host_readiness digest || exit
 test_machine_info='{"Host":{"CurrentMachine":"fixture","MachineImageDir":"/fixture"}}'
@@ -1638,6 +1677,13 @@ podman_json() {
  esac
 }
 host_readiness digest || exit
+CONTAINER_CPUS=5
+if host_readiness digest; then exit 1; fi
+CONTAINER_CPUS=4; CONTAINER_MEMORY=9g
+if host_readiness digest; then exit 1; fi
+CONTAINER_MEMORY=8g
+host_readiness digest || exit
+CONTAINER_CPUS=1; CONTAINER_MEMORY=2g
 client=6.0.2
 if host_readiness digest; then exit 1; fi
 client=6.2.0; server=6.3.0
@@ -2480,6 +2526,23 @@ operate <<< 1 || exit
             ('MIN_PODMAN_ARM64=6.1.1', 'MIN_PODMAN_ARM64=6.1.1-preview'),
             ('CONTAINER_STOP_TIMEOUT=45', 'CONTAINER_STOP_TIMEOUT=30'),
             ('DASHBOARD_CAPTURE_TIMEOUT=3', 'DASHBOARD_CAPTURE_TIMEOUT=2'),
+            ('DASHBOARD_BIND_IP=127.0.0.1', 'DASHBOARD_BIND_IP=0.0.0.0'),
+            ('DASHBOARD_BIND_IP=127.0.0.1', 'DASHBOARD_BIND_IP=127.0.0.256'),
+            ('DASHBOARD_BIND_IP=127.0.0.1', 'DASHBOARD_BIND_IP=127.00.0.1'),
+            ('DASHBOARD_LISTEN_IP=0.0.0.0', 'DASHBOARD_LISTEN_IP=not-an-address'),
+            ('DASHBOARD_LISTEN_IP=0.0.0.0', 'DASHBOARD_LISTEN_IP=127.0.0.1'),
+            ('DASHBOARD_LISTEN_IP=0.0.0.0', 'DASHBOARD_LISTEN_IP=224.0.0.1'),
+            ('DASHBOARD_LISTEN_IP=0.0.0.0', 'DASHBOARD_LISTEN_IP=255.255.255.255'),
+            ('CONTAINER_HOME=/opt/data', 'CONTAINER_HOME=/'),
+            ('CONTAINER_HOME=/opt/data', 'CONTAINER_HOME=/opt/../data'),
+            ('CONTAINER_HOME=/opt/data', 'CONTAINER_HOME=/opt/space here'),
+            ('TEMP_BASE_MACOS=/private/tmp', 'TEMP_BASE_MACOS=relative'),
+            ('TEMP_BASE_LINUX=/tmp', 'TEMP_BASE_LINUX=/tmp/../etc'),
+            ('MAINTENANCE_TIMEZONE=UTC', 'MAINTENANCE_TIMEZONE=$(touch no)'),
+            ('HTTP_CONNECT_TIMEOUT=3', 'HTTP_CONNECT_TIMEOUT=11'),
+            ('CONTAINER_SHM_SIZE=512m', 'CONTAINER_SHM_SIZE=3g'),
+            ('PROCESS_POLL_SECONDS=0.05', 'PROCESS_POLL_SECONDS=10'),
+            ('CHILD_TERM_GRACE_SECONDS=0.1', 'CHILD_TERM_GRACE_SECONDS=10'),
         ]
         config = (ROOT/'config/hermes-container.conf').read_text()
         for old, new in changes:
@@ -2526,6 +2589,10 @@ load_launcher_config "$ACCOUNT_HOME/custom.conf" || exit
             ('CONTAINER_SHM_SIZE=512m', 'CONTAINER_SHM_SIZE=256m'),
             ('RESTART_POLICY=unless-stopped', 'RESTART_POLICY=on-failure'),
             ('BACKUP_RETENTION_DAYS=14', 'BACKUP_RETENTION_DAYS=21'),
+            ('CONTAINER_HOME=/opt/data', 'CONTAINER_HOME=/srv/hermes'),
+            ('DASHBOARD_BIND_IP=127.0.0.1', 'DASHBOARD_BIND_IP=127.0.0.2'),
+            ('DASHBOARD_LISTEN_IP=0.0.0.0', 'DASHBOARD_LISTEN_IP=192.0.2.10'),
+            ('MAINTENANCE_TIMEZONE=UTC', 'MAINTENANCE_TIMEZONE=Africa/Johannesburg'),
         ]:
             config = config.replace(old, new)
         self.shell(r'''
@@ -2538,9 +2605,21 @@ load_workspace && acquire_lock && prepare_directories || exit
 [[ $(ACCOUNT_USER=someone dashboard_port) == 50123 ]] || exit 1
 build_runtime 'IMAGE_PLACEHOLDER' service "$HERMES_DATA" || exit
 [[ "${RUNTIME[*]}" == *'--cpus 2 --memory 3g --shm-size 256m'* &&
-   "${RUNTIME[*]}" == *'127.0.0.1:30123:9120'* &&
+   "${RUNTIME[*]}" == *'127.0.0.2:30123:9120'* &&
+   "${RUNTIME[*]}" == *'HERMES_DASHBOARD_HOST=192.0.2.10'* &&
    "${RUNTIME[*]}" == *'HERMES_DASHBOARD_PORT=9120'* &&
    "${RUNTIME[*]}" == *'--restart=on-failure'* ]] || exit 1
+[[ "${RUNTIME[*]}" == *'target=/srv/hermes"'* &&
+   "${RUNTIME[*]}" == *'target=/srv/hermes/backups"'* &&
+   "${RUNTIME[*]}" == *'--workdir=/srv/hermes'* ]] || exit 1
+show_dashboard 2> "$SCRATCH/dashboard"
+grep -F 'http://127.0.0.2:30123' "$SCRATCH/dashboard" || exit
+build_runtime 'IMAGE_PLACEHOLDER' backup "$HERMES_DATA" "$BACKUPS/pending" || exit
+[[ "${RUNTIME[*]}" == *'TZ=Africa/Johannesburg'* &&
+   "${RUNTIME[*]}" == *'backup --keep 0 --output /srv/hermes/backups/pending' ]] || exit 1
+build_runtime 'IMAGE_PLACEHOLDER' import "$HERMES_DATA" "$BACKUPS/input.zip" || exit
+[[ "${RUNTIME[*]}" == *'--network=none --workdir=/srv/hermes'* &&
+   "${RUNTIME[*]}" == *'TZ=Africa/Johannesburg'* ]] || exit 1
 [[ $(config_bytes "$CONTAINER_MEMORY") == 3221225472 ]] || exit 1
 cutoff=$(backup_cutoff); now=$(date -u +%s)
 ((now-cutoff>=21*86400 && now-cutoff<=21*86400+2)) || exit 1
@@ -2558,11 +2637,113 @@ printf '[1]' | strict_json >/dev/null || exit
 if printf '[[[1]]]' | strict_json >/dev/null; then exit 1; fi
 ''')
 
-    def test_config_check_does_not_require_terminal_or_podman(self):
+    def test_container_mount_targets_cannot_hide_each_other(self):
+        self.shell(r'''
+verify_source_paths || exit
+original_docs=$CONTAINER_DOCS; original_user_docs=$CONTAINER_USER_DOCS
+for target in "$CONTAINER_HOME" "$CONTAINER_HOME/docs" "${CONTAINER_HOME%/*}" /; do
+ CONTAINER_DOCS=$target
+ if verify_source_paths; then exit 1; fi
+done
+CONTAINER_DOCS=$original_docs
+for target in "$CONTAINER_HOME" "$CONTAINER_DOCS" "$CONTAINER_DOCS/child"; do
+ CONTAINER_USER_DOCS=$target
+ if verify_source_paths; then exit 1; fi
+done
+CONTAINER_USER_DOCS=$original_user_docs
+verify_source_paths
+''')
+
+    def test_custom_dashboard_address_is_used_for_readiness(self):
+        self.shell(r'''
+DASHBOARD_BIND_IP=127.0.0.2; DASHBOARD_PORTS=default:30123
+SERVICE_ID=fixture; SERVICE_STATE=running
+run_capture() {
+ [[ "${@: -1}" == http://127.0.0.2:30123/api/status ]] || return 99
+ CAPTURE_OUT=$SCRATCH/status
+ printf '{"auth_required":true,"auth_providers":["password"]}' > "$CAPTURE_OUT"
+}
+refresh_service() { return 0; }
+wait_dashboard
+''')
+
+    def test_dashboard_retry_delay_can_be_cancelled(self):
+        self.shell(r'''
+DASHBOARD_ATTEMPTS=2; DASHBOARD_POLL_SECONDS=5
+SERVICE_ID=fixture
+CURL=$SCRATCH/curl
+printf '#!/bin/sh\nexit 7\n' > "$CURL"
+chmod 700 "$CURL"
+trap 'interrupted 15' TERM
+(/bin/sleep 0.2; kill -TERM "$$") &
+signaler=$!
+started=$SECONDS
+wait_dashboard; status=$?
+wait "$signaler"
+[[ "$status" == 143 && -z "$CHILD_PID" ]] || exit 1
+((SECONDS-started<3))
+''')
+
+    def test_dashboard_final_request_preserves_cancellation(self):
+        for signal_number in (2, 15):
+            with self.subTest(signal=signal_number):
+                self.shell(f'test_signal={signal_number}\n' + r'''
+DASHBOARD_ATTEMPTS=1
+SERVICE_ID=fixture; SERVICE_NAME=fixture
+# Simulate cancellation delivered while the final HTTP request is running.
+run_capture() { INTERRUPTED=$test_signal; return "$((128+test_signal))"; }
+wait_dashboard
+''',
+                           expect=128+signal_number)
+
+    def test_dashboard_does_not_wait_after_its_last_attempt(self):
+        self.shell(r'''
+DASHBOARD_ATTEMPTS=1; DASHBOARD_POLL_SECONDS=5
+SERVICE_ID=fixture; SERVICE_NAME=fixture
+run_capture() { return 3; }
+started=$SECONDS
+wait_dashboard; status=$?
+[[ "$status" == 3 ]] || exit 1
+((SECONDS-started<3))
+''')
+
+    def test_dashboard_succeeds_after_a_retry(self):
+        self.shell(r'''
+DASHBOARD_ATTEMPTS=2; DASHBOARD_POLL_SECONDS=1
+SERVICE_ID=fixture; SERVICE_STATE=running
+CURL=$SCRATCH/curl
+cat > "$CURL" <<'SCRIPT'
+#!/bin/sh
+if [ ! -e "$0.called" ]; then
+ touch "$0.called"
+ exit 7
+fi
+printf '{"auth_required":true,"auth_providers":["password"]}'
+SCRIPT
+chmod 700 "$CURL"
+refresh_service() { return 0; }
+wait_dashboard || exit
+[[ -f "$CURL.called" && -z "$CHILD_PID" ]]
+''')
+
+    def test_custom_container_home_is_used_for_chat(self):
+        self.shell(r'''
+CONTAINER_HOME=/srv/hermes; SERVICE_ID=fixture
+verify_lock() { return 0; }; inventory_guard() { return 0; }
+PODMAN=$SCRATCH/podman
+printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$PODMAN"
+chmod 700 "$PODMAN"
+service_chat > "$SCRATCH/args" || exit
+grep -Fx 'HOME=/srv/hermes' "$SCRATCH/args" || exit
+grep -Fx "$CONTAINER_DOCS" "$SCRATCH/args"
+''')
+
+    def test_removed_config_check_is_rejected(self):
         result = subprocess.run([str(ROOT/'hermes-container.sh'), '--check-config'],
                                 text=True, capture_output=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Configuration is valid:', result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('invalid arguments', result.stderr)
+        self.assertNotIn('--check-config', result.stdout + result.stderr)
 
     def test_storage_checks_reject_overflow_and_malformed_byte_counts(self):
         self.shell(r'''
@@ -2650,10 +2831,13 @@ add_source_parents "$ACCOUNT_HOME" "$ACCOUNT_HOME/One/Two/Docs" || exit
 
     def test_endpoint_and_process_settings_are_validated(self):
         self.shell(r'''
-for value in http://api.example.test https://user:password@api.example.test https://api.example.test/path https://api.example.test:65536 https://-invalid.test https://api..test; do
+for value in http://api.example.test https://user:password@api.example.test https://api.example.test/path https://api.example.test:65536 https://-invalid.test https://api..test https://999.999.999.999 https://127.1 https://01.2.3.4; do
  if config_value_valid RELEASE_API_ORIGIN "$value"; then exit 1; fi
 done
 config_value_valid RELEASE_API_ORIGIN https://api.example.test:8443 || exit
+config_value_valid RELEASE_API_ORIGIN https://192.0.2.10:8443 || exit
+label=$(printf 'a%.0s' {1..63})
+if config_value_valid RELEASE_API_ORIGIN "https://$label.$label.$label.$label"; then exit 1; fi
 for value in 0 0.000 -1 1e2 0.1s '$(touch no)'; do
  if config_value_valid PROCESS_POLL_SECONDS "$value"; then exit 1; fi
 done
